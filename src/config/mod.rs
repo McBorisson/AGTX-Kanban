@@ -40,6 +40,10 @@ pub struct ThemeConfig {
     /// Accent color for highlights (hex, e.g. "#00FFFF")
     #[serde(default = "default_color_accent")]
     pub color_accent: String,
+
+    /// Color for task descriptions (hex, e.g. "#FFB6C1")
+    #[serde(default = "default_color_description")]
+    pub color_description: String,
 }
 
 impl Default for ThemeConfig {
@@ -50,6 +54,7 @@ impl Default for ThemeConfig {
             color_dimmed: default_color_dimmed(),
             color_text: default_color_text(),
             color_accent: default_color_accent(),
+            color_description: default_color_description(),
         }
     }
 }
@@ -72,6 +77,10 @@ fn default_color_text() -> String {
 
 fn default_color_accent() -> String {
     "#00FFFF".to_string() // Cyan
+}
+
+fn default_color_description() -> String {
+    "#E8909C".to_string() // Rose
 }
 
 impl ThemeConfig {

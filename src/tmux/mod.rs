@@ -2,7 +2,7 @@ use anyhow::{Context, Result};
 use std::process::Command;
 
 /// The tmux server name for agent sessions
-pub const AGENT_SERVER: &str = "agents";
+pub const AGENT_SERVER: &str = "agtx";
 
 /// Spawn a new agent session in the agents tmux server
 pub fn spawn_session(

@@ -13,6 +13,16 @@ pub fn create_worktree(project_path: &Path, task_slug: &str) -> Result<PathBuf> 
         .join(WORKTREES_DIR)
         .join(task_slug);
 
+    // If worktree already exists and is valid, return it
+    if worktree_path.exists() && worktree_path.join(".git").exists() {
+        return Ok(worktree_path);
+    }
+
+    // Clean up any partial worktree
+    if worktree_path.exists() {
+        let _ = std::fs::remove_dir_all(&worktree_path);
+    }
+
     // Ensure parent directory exists
     if let Some(parent) = worktree_path.parent() {
         std::fs::create_dir_all(parent)?;
@@ -23,6 +33,13 @@ pub fn create_worktree(project_path: &Path, task_slug: &str) -> Result<PathBuf> 
 
     // Create worktree with a new branch based on main
     let branch_name = format!("task/{}", task_slug);
+
+    // First, try to delete the branch if it exists (from a previous failed attempt)
+    let _ = Command::new("git")
+        .current_dir(project_path)
+        .args(["branch", "-D", &branch_name])
+        .output();
+
     let output = Command::new("git")
         .current_dir(project_path)
         .args(["worktree", "add"])
@@ -32,10 +49,8 @@ pub fn create_worktree(project_path: &Path, task_slug: &str) -> Result<PathBuf> 
         .context("Failed to create git worktree")?;
 
     if !output.status.success() {
-        anyhow::bail!(
-            "Failed to create worktree: {}",
-            String::from_utf8_lossy(&output.stderr)
-        );
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        anyhow::bail!("Failed to create worktree: {}", stderr);
     }
 
     Ok(worktree_path)

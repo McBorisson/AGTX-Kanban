@@ -7,6 +7,7 @@ use crossterm::{
 use ratatui::{prelude::*, widgets::*};
 use std::io::{self, Stdout};
 use std::path::{Path, PathBuf};
+use std::sync::mpsc;
 
 use crate::agent;
 use crate::config::{GlobalConfig, MergedConfig, ProjectConfig, ThemeConfig};
@@ -61,6 +62,46 @@ struct AppState {
     pr_confirm_popup: Option<PrConfirmPopup>,
     // Moving Review back to Running
     review_to_running_task_id: Option<String>,
+    // Git diff popup
+    diff_popup: Option<DiffPopup>,
+    // Channel for receiving PR description generation results
+    pr_generation_rx: Option<mpsc::Receiver<(String, String)>>,
+    // PR creation status popup
+    pr_status_popup: Option<PrStatusPopup>,
+    // Channel for receiving PR creation results
+    pr_creation_rx: Option<mpsc::Receiver<Result<(i32, String), String>>>,
+    // Confirmation popup for moving to Done with open PR
+    done_confirm_popup: Option<DoneConfirmPopup>,
+}
+
+/// State for confirming move to Done when PR is still open
+#[derive(Debug, Clone)]
+struct DoneConfirmPopup {
+    task_id: String,
+    pr_number: i32,
+}
+
+/// State for PR creation status popup (loading/success/error)
+#[derive(Debug, Clone)]
+struct PrStatusPopup {
+    status: PrCreationStatus,
+    pr_url: Option<String>,
+    error_message: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+enum PrCreationStatus {
+    Creating,
+    Success,
+    Error,
+}
+
+/// State for git diff popup
+#[derive(Debug, Clone)]
+struct DiffPopup {
+    task_title: String,
+    diff_content: String,
+    scroll_offset: usize,
 }
 
 /// State for task search popup
@@ -178,6 +219,11 @@ impl App {
                 task_search: None,
                 pr_confirm_popup: None,
                 review_to_running_task_id: None,
+                diff_popup: None,
+                pr_generation_rx: None,
+                pr_status_popup: None,
+                pr_creation_rx: None,
+                done_confirm_popup: None,
             },
         };
 
@@ -192,6 +238,42 @@ impl App {
     pub async fn run(&mut self) -> Result<()> {
         while !self.state.should_quit {
             self.draw()?;
+
+            // Check for PR generation completion
+            if let Some(ref rx) = self.state.pr_generation_rx {
+                if let Ok((pr_title, pr_body)) = rx.try_recv() {
+                    if let Some(ref mut popup) = self.state.pr_confirm_popup {
+                        popup.pr_title = pr_title;
+                        popup.pr_body = pr_body;
+                        popup.generating = false;
+                    }
+                    self.state.pr_generation_rx = None;
+                }
+            }
+
+            // Check for PR creation completion
+            if let Some(ref rx) = self.state.pr_creation_rx {
+                if let Ok(result) = rx.try_recv() {
+                    match result {
+                        Ok((_, pr_url)) => {
+                            self.state.pr_status_popup = Some(PrStatusPopup {
+                                status: PrCreationStatus::Success,
+                                pr_url: Some(pr_url),
+                                error_message: None,
+                            });
+                        }
+                        Err(err) => {
+                            self.state.pr_status_popup = Some(PrStatusPopup {
+                                status: PrCreationStatus::Error,
+                                pr_url: None,
+                                error_message: Some(err),
+                            });
+                        }
+                    }
+                    self.state.pr_creation_rx = None;
+                    self.refresh_tasks()?;
+                }
+            }
 
             if event::poll(std::time::Duration::from_millis(100))? {
                 if let Event::Key(key) = event::read()? {
@@ -381,16 +463,22 @@ impl App {
         let footer_text = match state.input_mode {
             InputMode::Normal => {
                 if state.sidebar_focused {
-                    " [j/k] navigate  [Enter] open  [l] board  [e] hide sidebar  [q] quit "
+                    " [j/k] navigate  [Enter] open  [l] board  [e] hide sidebar  [q] quit ".to_string()
                 } else {
-                    " [o] new  [/] search  [Enter] open  [d] del  [m] move  [r] resume  [e] sidebar  [q] quit"
+                    // Show [r] resume only when Review column is focused
+                    let is_review_column = state.board.selected_column == 3; // Review is index 3
+                    if is_review_column {
+                        " [o] new  [/] search  [Enter] open  [x] del  [d] diff  [m] move  [r] resume  [e] sidebar  [q] quit".to_string()
+                    } else {
+                        " [o] new  [/] search  [Enter] open  [x] del  [d] diff  [m] move  [e] sidebar  [q] quit".to_string()
+                    }
                 }
             }
-            InputMode::InputTitle => " Enter task title... [Esc] cancel [Enter] next ",
-            InputMode::InputDescription => " Enter prompt for agent... [Esc] cancel [\\+Enter] newline [Enter] save ",
+            InputMode::InputTitle => " Enter task title... [Esc] cancel [Enter] next ".to_string(),
+            InputMode::InputDescription => " Enter prompt for agent... [Esc] cancel [\\+Enter] newline [Enter] save ".to_string(),
         };
 
-        let footer = Paragraph::new(footer_text)
+        let footer = Paragraph::new(footer_text.as_str())
             .style(Style::default().fg(Color::DarkGray))
             .block(Block::default().borders(Borders::ALL));
         frame.render_widget(footer, chunks[2]);
@@ -424,13 +512,13 @@ impl App {
             };
 
             let input = Paragraph::new(content)
-                .style(Style::default().fg(Color::Yellow))
+                .style(Style::default().fg(hex_to_color(&state.config.theme.color_text)))
                 .wrap(Wrap { trim: false })
                 .block(
                     Block::default()
                         .title(title)
                         .borders(Borders::ALL)
-                        .border_style(Style::default().fg(Color::Yellow)),
+                        .border_style(Style::default().fg(hex_to_color(&state.config.theme.color_selected))),
                 );
             frame.render_widget(input, input_area);
 
@@ -484,8 +572,18 @@ impl App {
 
         // Shell popup overlay
         if let Some(popup) = &state.shell_popup {
-            let popup_area = centered_rect(75, 75, area);
+            let popup_area = centered_rect_fixed_width(80, 75, area);
             frame.render_widget(Clear, popup_area);
+
+            // Resize tmux pane to match popup dimensions for proper display
+            let pane_width = popup_area.width.saturating_sub(2);
+            let pane_height = popup_area.height.saturating_sub(4);
+            let _ = std::process::Command::new("tmux")
+                .args(["-L", tmux::AGENT_SERVER])
+                .args(["resize-pane", "-t", &popup.window_name])
+                .args(["-x", &pane_width.to_string()])
+                .args(["-y", &pane_height.to_string()])
+                .output();
 
             // Capture tmux pane content with more history
             let pane_content = capture_tmux_pane_with_history(&popup.window_name, 500);
@@ -510,8 +608,16 @@ impl App {
             let styled_lines = parse_ansi_to_lines(&pane_content);
             let visible_height = popup_chunks[1].height.saturating_sub(2) as usize;
 
+            // Filter out trailing empty lines to find actual content
+            let non_empty_count = styled_lines.iter()
+                .rposition(|line| !line.spans.is_empty() &&
+                    !line.spans.iter().all(|s| s.content.trim().is_empty()))
+                .map(|i| i + 1)
+                .unwrap_or(styled_lines.len());
+
+            let total_lines = non_empty_count.max(1);
+
             // Apply scroll offset
-            let total_lines = styled_lines.len();
             let start_line = if popup.scroll_offset < 0 {
                 // Scrolling up into history
                 total_lines.saturating_sub(visible_height).saturating_sub((-popup.scroll_offset) as usize)
@@ -522,23 +628,20 @@ impl App {
 
             let visible_lines: Vec<Line> = styled_lines
                 .into_iter()
+                .take(non_empty_count)
                 .skip(start_line)
                 .take(visible_height)
                 .collect();
 
             let content = Paragraph::new(visible_lines)
-                .block(
-                    Block::default()
-                        .borders(Borders::LEFT | Borders::RIGHT)
-                        .border_style(Style::default().fg(Color::Cyan)),
-                );
+                .wrap(Wrap { trim: false });
             frame.render_widget(content, popup_chunks[1]);
 
             // Footer with scroll indicator
             let scroll_indicator = if popup.scroll_offset < 0 {
-                format!(" [↑↓/jk] scroll [g] bottom [Esc] close | Line {} ", start_line + 1)
+                format!(" [Ctrl+j/k] scroll [Ctrl+g] bottom [Ctrl+q] close | Line {} ", start_line + 1)
             } else {
-                " [↑↓/jk] scroll [Esc] close | At bottom ".to_string()
+                " [Ctrl+j/k] scroll [Ctrl+q] close | At bottom ".to_string()
             };
             let footer = Paragraph::new(scroll_indicator)
                 .style(Style::default().fg(Color::Black).bg(Color::DarkGray));
@@ -608,72 +711,244 @@ impl App {
             let popup_area = centered_rect(60, 60, area);
             frame.render_widget(Clear, popup_area);
 
+            // Show loading state while generating
+            if popup.generating {
+                let main_block = Block::default()
+                    .title(" Create Pull Request ")
+                    .borders(Borders::ALL)
+                    .border_style(Style::default().fg(Color::Yellow));
+                frame.render_widget(main_block, popup_area);
+
+                // Spinner animation based on frame count
+                let spinner_chars = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+                let spinner_idx = (std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_millis() / 100) as usize % spinner_chars.len();
+                let spinner = spinner_chars[spinner_idx];
+
+                let loading_text = format!("{} Generating PR description with Claude...", spinner);
+                let loading = Paragraph::new(loading_text)
+                    .style(Style::default().fg(Color::Cyan))
+                    .alignment(ratatui::layout::Alignment::Center);
+
+                // Center vertically within the popup
+                let inner = popup_area.inner(ratatui::layout::Margin {
+                    horizontal: 2,
+                    vertical: popup_area.height.saturating_sub(3) / 2
+                });
+                frame.render_widget(loading, inner);
+            } else {
+                let popup_chunks = Layout::default()
+                    .direction(Direction::Vertical)
+                    .constraints([
+                        Constraint::Length(3),  // Title input
+                        Constraint::Min(0),     // Body input
+                        Constraint::Length(1),  // Help line
+                    ])
+                    .margin(1)
+                    .split(popup_area);
+
+                // Main border
+                let main_block = Block::default()
+                    .title(" Create Pull Request ")
+                    .borders(Borders::ALL)
+                    .border_style(Style::default().fg(Color::Green));
+                frame.render_widget(main_block, popup_area);
+
+                // Title input
+                let title_style = if popup.editing_title {
+                    Style::default().fg(Color::Yellow)
+                } else {
+                    Style::default().fg(Color::White)
+                };
+                let title_border = if popup.editing_title {
+                    Style::default().fg(Color::Yellow)
+                } else {
+                    Style::default().fg(Color::DarkGray)
+                };
+                let title_cursor = if popup.editing_title { "█" } else { "" };
+                let title_input = Paragraph::new(format!("{}{}", popup.pr_title, title_cursor))
+                    .style(title_style)
+                    .block(
+                        Block::default()
+                            .title(" Title ")
+                            .borders(Borders::ALL)
+                            .border_style(title_border),
+                    );
+                frame.render_widget(title_input, popup_chunks[0]);
+
+                // Body input
+                let body_style = if !popup.editing_title {
+                    Style::default().fg(Color::Yellow)
+                } else {
+                    Style::default().fg(Color::White)
+                };
+                let body_border = if !popup.editing_title {
+                    Style::default().fg(Color::Yellow)
+                } else {
+                    Style::default().fg(Color::DarkGray)
+                };
+                let body_cursor = if !popup.editing_title { "█" } else { "" };
+                let body_input = Paragraph::new(format!("{}{}", popup.pr_body, body_cursor))
+                    .style(body_style)
+                    .wrap(Wrap { trim: false })
+                    .block(
+                        Block::default()
+                            .title(" Description ")
+                            .borders(Borders::ALL)
+                            .border_style(body_border),
+                    );
+                frame.render_widget(body_input, popup_chunks[1]);
+
+                // Help line
+                let help = Paragraph::new(" [Tab] switch field  [Ctrl+s] create PR  [Esc] cancel ")
+                    .style(Style::default().fg(Color::DarkGray));
+                frame.render_widget(help, popup_chunks[2]);
+            }
+        }
+
+        // PR creation status popup (loading/success/error)
+        if let Some(ref popup) = state.pr_status_popup {
+            let popup_area = centered_rect(50, 20, area);
+            frame.render_widget(Clear, popup_area);
+
+            let (title, border_color) = match popup.status {
+                PrCreationStatus::Creating => (" Creating Pull Request ", Color::Yellow),
+                PrCreationStatus::Success => (" Pull Request Created ", Color::Green),
+                PrCreationStatus::Error => (" Error Creating PR ", Color::Red),
+            };
+
+            let main_block = Block::default()
+                .title(title)
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(border_color));
+            frame.render_widget(main_block, popup_area);
+
+            let inner = popup_area.inner(ratatui::layout::Margin { horizontal: 2, vertical: 2 });
+
+            match popup.status {
+                PrCreationStatus::Creating => {
+                    let spinner_chars = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+                    let spinner_idx = (std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_millis() / 100) as usize % spinner_chars.len();
+                    let spinner = spinner_chars[spinner_idx];
+
+                    let text = format!("{} Pushing branch and creating PR...", spinner);
+                    let content = Paragraph::new(text)
+                        .style(Style::default().fg(Color::Cyan))
+                        .alignment(ratatui::layout::Alignment::Center);
+                    frame.render_widget(content, inner);
+                }
+                PrCreationStatus::Success => {
+                    let url = popup.pr_url.as_deref().unwrap_or("unknown");
+                    // Check if this was a push to existing PR or new PR creation
+                    let message = if url.starts_with("http") {
+                        format!("Success!\n\n{}\n\n[Enter] to close", url)
+                    } else {
+                        format!("{}\n\n[Enter] to close", url)
+                    };
+                    let content = Paragraph::new(message)
+                        .style(Style::default().fg(Color::Green))
+                        .alignment(ratatui::layout::Alignment::Center);
+                    frame.render_widget(content, inner);
+                }
+                PrCreationStatus::Error => {
+                    let err = popup.error_message.as_deref().unwrap_or("Unknown error");
+                    let text = format!("Failed to create PR:\n\n{}\n\n[Enter] to close", err);
+                    let content = Paragraph::new(text)
+                        .style(Style::default().fg(Color::Red))
+                        .alignment(ratatui::layout::Alignment::Center)
+                        .wrap(Wrap { trim: false });
+                    frame.render_widget(content, inner);
+                }
+            }
+        }
+
+        // Done confirmation popup (when PR is still open)
+        if let Some(ref popup) = state.done_confirm_popup {
+            let popup_area = centered_rect(50, 25, area);
+            frame.render_widget(Clear, popup_area);
+
+            let main_block = Block::default()
+                .title(" Move to Done? ")
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(Color::Yellow));
+            frame.render_widget(main_block, popup_area);
+
+            let inner = popup_area.inner(ratatui::layout::Margin { horizontal: 2, vertical: 2 });
+            let text = format!(
+                "PR #{} is still open.\n\nAre you sure you want to move this task to Done?\n\nThis will clean up the worktree and branch.\n\n[y] Yes, move to Done    [n/Esc] Cancel",
+                popup.pr_number
+            );
+            let content = Paragraph::new(text)
+                .style(Style::default().fg(Color::White))
+                .alignment(ratatui::layout::Alignment::Center)
+                .wrap(Wrap { trim: false });
+            frame.render_widget(content, inner);
+        }
+
+        // Git diff popup
+        if let Some(ref popup) = state.diff_popup {
+            let popup_area = centered_rect(80, 80, area);
+            frame.render_widget(Clear, popup_area);
+
             let popup_chunks = Layout::default()
                 .direction(Direction::Vertical)
                 .constraints([
-                    Constraint::Length(3),  // Title input
-                    Constraint::Min(0),     // Body input
-                    Constraint::Length(1),  // Help line
+                    Constraint::Length(1), // Title bar
+                    Constraint::Min(0),    // Diff content
+                    Constraint::Length(1), // Footer
                 ])
-                .margin(1)
                 .split(popup_area);
 
-            // Main border
-            let main_block = Block::default()
-                .title(" Create Pull Request ")
-                .borders(Borders::ALL)
-                .border_style(Style::default().fg(Color::Green));
-            frame.render_widget(main_block, popup_area);
+            // Title bar
+            let title = format!(" Diff: {} ", popup.task_title);
+            let title_bar = Paragraph::new(title)
+                .style(Style::default().fg(Color::Black).bg(Color::Cyan));
+            frame.render_widget(title_bar, popup_chunks[0]);
 
-            // Title input
-            let title_style = if popup.editing_title {
-                Style::default().fg(Color::Yellow)
-            } else {
-                Style::default().fg(Color::White)
-            };
-            let title_border = if popup.editing_title {
-                Style::default().fg(Color::Yellow)
-            } else {
-                Style::default().fg(Color::DarkGray)
-            };
-            let title_cursor = if popup.editing_title { "█" } else { "" };
-            let title_input = Paragraph::new(format!("{}{}", popup.pr_title, title_cursor))
-                .style(title_style)
+            // Diff content with syntax highlighting
+            let lines: Vec<Line> = popup.diff_content
+                .lines()
+                .skip(popup.scroll_offset)
+                .take(popup_chunks[1].height.saturating_sub(2) as usize)
+                .map(|line| {
+                    let style = if line.starts_with('+') && !line.starts_with("+++") {
+                        Style::default().fg(Color::Green)
+                    } else if line.starts_with('-') && !line.starts_with("---") {
+                        Style::default().fg(Color::Red)
+                    } else if line.starts_with("@@") {
+                        Style::default().fg(Color::Cyan)
+                    } else if line.starts_with("diff ") || line.starts_with("index ") {
+                        Style::default().fg(Color::Yellow)
+                    } else {
+                        Style::default().fg(Color::White)
+                    };
+                    Line::from(Span::styled(line, style))
+                })
+                .collect();
+
+            let diff_content = Paragraph::new(lines)
                 .block(
                     Block::default()
-                        .title(" Title ")
                         .borders(Borders::ALL)
-                        .border_style(title_border),
+                        .border_style(Style::default().fg(Color::Cyan)),
                 );
-            frame.render_widget(title_input, popup_chunks[0]);
+            frame.render_widget(diff_content, popup_chunks[1]);
 
-            // Body input
-            let body_style = if !popup.editing_title {
-                Style::default().fg(Color::Yellow)
-            } else {
-                Style::default().fg(Color::White)
-            };
-            let body_border = if !popup.editing_title {
-                Style::default().fg(Color::Yellow)
-            } else {
-                Style::default().fg(Color::DarkGray)
-            };
-            let body_cursor = if !popup.editing_title { "█" } else { "" };
-            let body_input = Paragraph::new(format!("{}{}", popup.pr_body, body_cursor))
-                .style(body_style)
-                .wrap(Wrap { trim: false })
-                .block(
-                    Block::default()
-                        .title(" Description ")
-                        .borders(Borders::ALL)
-                        .border_style(body_border),
-                );
-            frame.render_widget(body_input, popup_chunks[1]);
-
-            // Help line
-            let help = Paragraph::new(" [Tab] switch field  [Ctrl+Enter] create PR  [Esc] cancel ")
-                .style(Style::default().fg(Color::DarkGray));
-            frame.render_widget(help, popup_chunks[2]);
+            // Footer with scroll info
+            let total_lines = popup.diff_content.lines().count();
+            let footer_text = format!(
+                " [j/k] scroll  [d/u] page  [g/G] top/bottom  [q/Esc] close  ({}/{}) ",
+                popup.scroll_offset + 1,
+                total_lines
+            );
+            let footer = Paragraph::new(footer_text)
+                .style(Style::default().fg(Color::Black).bg(Color::DarkGray));
+            frame.render_widget(footer, popup_chunks[2]);
         }
     }
 
@@ -690,10 +965,11 @@ impl App {
             Style::default().fg(hex_to_color(&theme.color_text)).bold()
         };
 
-        // Truncate title to fit
+        // Truncate title to fit (char-safe for UTF-8)
         let max_title_len = area.width.saturating_sub(4) as usize;
-        let title: String = if task.title.len() > max_title_len {
-            format!("{}...", &task.title[..max_title_len.saturating_sub(3)])
+        let title: String = if task.title.chars().count() > max_title_len {
+            let truncated: String = task.title.chars().take(max_title_len.saturating_sub(3)).collect();
+            format!("{}...", truncated)
         } else {
             task.title.clone()
         };
@@ -714,7 +990,7 @@ impl App {
         };
         frame.render_widget(title_line, title_area);
 
-        // Preview area (below title)
+        // Preview area (below title) - always show description
         if inner.height > 1 {
             let preview_area = Rect {
                 x: inner.x,
@@ -723,53 +999,21 @@ impl App {
                 height: inner.height.saturating_sub(1),
             };
 
-            if let Some(session_name) = &task.session_name {
-                // Capture tmux pane content for preview
-                let pane_content = capture_tmux_pane(session_name);
-                let lines = parse_ansi_to_lines(&pane_content);
+            // Show description or placeholder
+            let preview_text = task.description.as_deref().unwrap_or("No description");
 
-                // Skip last 5 lines (input prompt area) and take lines that fit
-                let skip_last = 5;
-                let max_width = preview_area.width as usize;
-                let preview_lines: Vec<Line> = lines
-                    .into_iter()
-                    .rev()
-                    .skip(skip_last)
-                    .take(preview_area.height as usize)
-                    .map(|line| {
-                        // Truncate each line to fit the preview width
-                        let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
-                        if text.len() > max_width {
-                            Line::from(format!("{}…", &text[..max_width.saturating_sub(1)]))
-                        } else {
-                            line
-                        }
-                    })
-                    .collect::<Vec<_>>()
-                    .into_iter()
-                    .rev()
-                    .collect();
-
-                let preview = Paragraph::new(preview_lines)
-                    .style(Style::default().fg(Color::DarkGray));
-                frame.render_widget(preview, preview_area);
+            // Truncate description to fit preview area
+            let max_chars = (preview_area.width as usize) * (preview_area.height as usize);
+            let truncated: String = if preview_text.chars().count() > max_chars {
+                format!("{}...", preview_text.chars().take(max_chars.saturating_sub(3)).collect::<String>())
             } else {
-                // No session - show description preview or placeholder
-                let preview_text = task.description.as_deref().unwrap_or("No agent session");
+                preview_text.to_string()
+            };
 
-                // Truncate description to fit preview area
-                let max_chars = (preview_area.width as usize) * (preview_area.height as usize);
-                let truncated: String = if preview_text.len() > max_chars {
-                    format!("{}...", &preview_text.chars().take(max_chars.saturating_sub(3)).collect::<String>())
-                } else {
-                    preview_text.to_string()
-                };
-
-                let preview = Paragraph::new(truncated)
-                    .style(Style::default().fg(Color::DarkGray).italic())
-                    .wrap(Wrap { trim: true });
-                frame.render_widget(preview, preview_area);
-            }
+            let preview = Paragraph::new(truncated)
+                .style(Style::default().fg(hex_to_color(&theme.color_description)))
+                .wrap(Wrap { trim: true });
+            frame.render_widget(preview, preview_area);
         }
     }
 
@@ -887,6 +1131,27 @@ impl App {
     }
 
     fn handle_key(&mut self, key: crossterm::event::KeyEvent) -> Result<()> {
+        // Handle PR status popup if open (loading/success/error)
+        if let Some(ref popup) = self.state.pr_status_popup {
+            // Only allow closing if not in Creating state
+            if popup.status != PrCreationStatus::Creating {
+                if matches!(key.code, KeyCode::Enter | KeyCode::Esc) {
+                    self.state.pr_status_popup = None;
+                }
+            }
+            return Ok(());
+        }
+
+        // Handle Done confirmation popup if open
+        if self.state.done_confirm_popup.is_some() {
+            return self.handle_done_confirm_key(key);
+        }
+
+        // Handle diff popup if open
+        if self.state.diff_popup.is_some() {
+            return self.handle_diff_popup_key(key);
+        }
+
         // Handle PR confirmation popup if open
         if self.state.pr_confirm_popup.is_some() {
             return self.handle_pr_confirm_key(key);
@@ -915,6 +1180,53 @@ impl App {
         }
     }
 
+    fn handle_done_confirm_key(&mut self, key: crossterm::event::KeyEvent) -> Result<()> {
+        if let Some(popup) = self.state.done_confirm_popup.clone() {
+            match key.code {
+                KeyCode::Char('y') | KeyCode::Char('Y') => {
+                    // Confirmed - force move to Done
+                    self.state.done_confirm_popup = None;
+                    self.force_move_to_done(&popup.task_id)?;
+                }
+                KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
+                    // Cancelled
+                    self.state.done_confirm_popup = None;
+                }
+                _ => {}
+            }
+        }
+        Ok(())
+    }
+
+    fn force_move_to_done(&mut self, task_id: &str) -> Result<()> {
+        if let (Some(db), Some(project_path)) = (&self.state.db, self.state.project_path.clone()) {
+            if let Some(mut task) = db.get_task(task_id)? {
+                // Cleanup resources
+                if let Some(session_name) = &task.session_name {
+                    let _ = std::process::Command::new("tmux")
+                        .args(["-L", tmux::AGENT_SERVER])
+                        .args(["kill-window", "-t", session_name])
+                        .output();
+                }
+                if let Some(worktree) = &task.worktree_path {
+                    let _ = std::process::Command::new("git")
+                        .current_dir(&project_path)
+                        .args(["worktree", "remove", "--force", worktree])
+                        .output();
+                }
+                // Keep the branch so task can be reopened later
+
+                task.session_name = None;
+                task.worktree_path = None;
+                task.status = TaskStatus::Done;
+                task.updated_at = chrono::Utc::now();
+                db.update_task(&task)?;
+                self.refresh_tasks()?;
+            }
+        }
+        Ok(())
+    }
+
     fn handle_pr_confirm_key(&mut self, key: crossterm::event::KeyEvent) -> Result<()> {
         use crossterm::event::KeyModifiers;
 
@@ -927,19 +1239,22 @@ impl App {
                     // Switch between title and body editing
                     popup.editing_title = !popup.editing_title;
                 }
-                KeyCode::Enter => {
-                    if popup.editing_title {
-                        // Move to body editing
-                        popup.editing_title = false;
-                    } else if key.modifiers.contains(KeyModifiers::CONTROL) {
-                        // Ctrl+Enter: Submit and create PR
+                KeyCode::Char('s') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    if !popup.generating {
+                        // Ctrl+s: Submit and create PR
                         let task_id = popup.task_id.clone();
                         let pr_title = popup.pr_title.clone();
                         let pr_body = popup.pr_body.clone();
                         self.state.pr_confirm_popup = None;
                         self.create_pr_and_move_to_review_with_content(&task_id, &pr_title, &pr_body)?;
-                    } else {
-                        // Regular Enter in body: add newline
+                    }
+                }
+                KeyCode::Enter => {
+                    if popup.editing_title && !popup.generating {
+                        // Enter in title: move to body editing
+                        popup.editing_title = false;
+                    } else if !popup.generating {
+                        // Enter in body: add newline
                         popup.pr_body.push('\n');
                     }
                 }
@@ -975,23 +1290,45 @@ impl App {
                 }
                 task.session_name = None;
 
-                // Create PR with provided title and body
-                match create_pr_with_content(&task, &project_path, pr_title, pr_body) {
-                    Ok((pr_number, pr_url)) => {
-                        task.pr_number = Some(pr_number);
-                        task.pr_url = Some(pr_url);
-                    }
-                    Err(e) => {
-                        // TODO: Show error to user
-                        eprintln!("Failed to create PR: {}", e);
-                    }
-                }
+                // Show loading popup
+                self.state.pr_status_popup = Some(PrStatusPopup {
+                    status: PrCreationStatus::Creating,
+                    pr_url: None,
+                    error_message: None,
+                });
 
-                // Move to Review
-                task.status = TaskStatus::Review;
-                task.updated_at = chrono::Utc::now();
-                db.update_task(&task)?;
-                self.refresh_tasks()?;
+                // Clone data for background thread
+                let task_clone = task.clone();
+                let project_path_clone = project_path.clone();
+                let pr_title_clone = pr_title.to_string();
+                let pr_body_clone = pr_body.to_string();
+
+                // Create channel for result
+                let (tx, rx) = mpsc::channel();
+                self.state.pr_creation_rx = Some(rx);
+
+                // Spawn background thread to create PR
+                std::thread::spawn(move || {
+                    let result = create_pr_with_content(&task_clone, &project_path_clone, &pr_title_clone, &pr_body_clone);
+                    match result {
+                        Ok((pr_number, pr_url)) => {
+                            // Update task in database from background thread
+                            if let Ok(db) = crate::db::Database::open_project(&project_path_clone) {
+                                let mut updated_task = task_clone;
+                                updated_task.pr_number = Some(pr_number);
+                                updated_task.pr_url = Some(pr_url.clone());
+                                updated_task.session_name = None;
+                                updated_task.status = TaskStatus::Review;
+                                updated_task.updated_at = chrono::Utc::now();
+                                let _ = db.update_task(&updated_task);
+                            }
+                            let _ = tx.send(Ok((pr_number, pr_url)));
+                        }
+                        Err(e) => {
+                            let _ = tx.send(Err(e.to_string()));
+                        }
+                    }
+                });
             }
         }
         Ok(())
@@ -1006,7 +1343,7 @@ impl App {
                 true
             }
             KeyCode::Enter => {
-                // Jump to selected task
+                // Jump to selected task and open it
                 if let Some(ref search) = self.state.task_search {
                     if let Some((task_id, _, status)) = search.matches.get(search.selected).cloned() {
                         // Find column index for this status
@@ -1023,6 +1360,8 @@ impl App {
                     }
                 }
                 self.state.task_search = None;
+                // Open the selected task (same as pressing Enter on a task)
+                self.open_selected_task()?;
                 true
             }
             KeyCode::Up | KeyCode::BackTab => {
@@ -1129,8 +1468,8 @@ impl App {
             let has_ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
 
             match key.code {
-                KeyCode::Esc => {
-                    // Close popup
+                // Ctrl+q = close popup
+                KeyCode::Char('q') if has_ctrl => {
                     self.state.shell_popup = None;
                 }
                 // Scroll with Ctrl+k or Ctrl+Up
@@ -1152,9 +1491,41 @@ impl App {
                     popup.scroll_offset = 0;
                 }
                 _ => {
-                    // Forward all other keys to tmux window
+                    // Forward all other keys to tmux window (including Esc)
                     send_key_to_tmux(&window_name, key.code);
                 }
+            }
+        }
+        Ok(())
+    }
+
+    fn handle_diff_popup_key(&mut self, key: crossterm::event::KeyEvent) -> Result<()> {
+        if let Some(ref mut popup) = self.state.diff_popup {
+            match key.code {
+                KeyCode::Esc | KeyCode::Char('q') => {
+                    self.state.diff_popup = None;
+                }
+                KeyCode::Char('j') | KeyCode::Down => {
+                    popup.scroll_offset = popup.scroll_offset.saturating_add(1);
+                }
+                KeyCode::Char('k') | KeyCode::Up => {
+                    popup.scroll_offset = popup.scroll_offset.saturating_sub(1);
+                }
+                KeyCode::Char('d') | KeyCode::PageDown => {
+                    popup.scroll_offset = popup.scroll_offset.saturating_add(20);
+                }
+                KeyCode::Char('u') | KeyCode::PageUp => {
+                    popup.scroll_offset = popup.scroll_offset.saturating_sub(20);
+                }
+                KeyCode::Char('g') => {
+                    popup.scroll_offset = 0;
+                }
+                KeyCode::Char('G') => {
+                    // Go to end
+                    let line_count = popup.diff_content.lines().count();
+                    popup.scroll_offset = line_count.saturating_sub(10);
+                }
+                _ => {}
             }
         }
         Ok(())
@@ -1253,7 +1624,8 @@ impl App {
                     }
                 }
             }
-            KeyCode::Char('d') => self.delete_selected_task()?,
+            KeyCode::Char('x') => self.delete_selected_task()?,
+            KeyCode::Char('d') => self.show_task_diff()?,
             KeyCode::Char('m') => self.move_task_right()?,
             KeyCode::Char('r') => {
                 // Move Review task back to Running (for PR changes)
@@ -1461,159 +1833,396 @@ impl App {
         Ok(())
     }
 
-    fn move_task_right(&mut self) -> Result<()> {
-        if let (Some(task), Some(project_path)) = (
-            self.state.board.selected_task_mut(),
-            self.state.project_path.clone(),
-        ) {
-            let current_status = task.status;
-            let next_status = match current_status {
-                TaskStatus::Backlog => Some(TaskStatus::Planning),
-                TaskStatus::Planning => Some(TaskStatus::Running),
-                TaskStatus::Running => Some(TaskStatus::Review),
-                TaskStatus::Review => Some(TaskStatus::Done),
-                TaskStatus::Done => None,
+    fn show_task_diff(&mut self) -> Result<()> {
+        if let Some(task) = self.state.board.selected_task() {
+            let diff_content = if let Some(worktree_path) = &task.worktree_path {
+                let mut sections = Vec::new();
+
+                // Unstaged changes (modified tracked files)
+                let unstaged = std::process::Command::new("git")
+                    .current_dir(worktree_path)
+                    .args(["diff"])
+                    .output()
+                    .map(|o| String::from_utf8_lossy(&o.stdout).to_string())
+                    .unwrap_or_default();
+
+                if !unstaged.trim().is_empty() {
+                    sections.push(format!("=== Unstaged Changes ===\n\n{}", unstaged));
+                }
+
+                // Staged changes
+                let staged = std::process::Command::new("git")
+                    .current_dir(worktree_path)
+                    .args(["diff", "--cached"])
+                    .output()
+                    .map(|o| String::from_utf8_lossy(&o.stdout).to_string())
+                    .unwrap_or_default();
+
+                if !staged.trim().is_empty() {
+                    sections.push(format!("=== Staged Changes ===\n\n{}", staged));
+                }
+
+                // Untracked files - show as diff (new file content)
+                let untracked = std::process::Command::new("git")
+                    .current_dir(worktree_path)
+                    .args(["ls-files", "--others", "--exclude-standard"])
+                    .output()
+                    .map(|o| String::from_utf8_lossy(&o.stdout).to_string())
+                    .unwrap_or_default();
+
+                if !untracked.trim().is_empty() {
+                    let mut untracked_section = String::from("=== Untracked Files ===\n");
+                    for file in untracked.lines() {
+                        if file.trim().is_empty() {
+                            continue;
+                        }
+                        // Show diff for untracked file (as if adding new file)
+                        let file_diff = std::process::Command::new("git")
+                            .current_dir(worktree_path)
+                            .args(["diff", "--no-index", "/dev/null", file])
+                            .output()
+                            .map(|o| String::from_utf8_lossy(&o.stdout).to_string())
+                            .unwrap_or_default();
+
+                        if !file_diff.trim().is_empty() {
+                            untracked_section.push_str(&format!("\n{}", file_diff));
+                        } else {
+                            // Fallback: just show file name
+                            untracked_section.push_str(&format!("\n+++ new file: {}\n", file));
+                        }
+                    }
+                    sections.push(untracked_section);
+                }
+
+                if sections.is_empty() {
+                    format!("(no changes)\n\nWorktree: {}", worktree_path)
+                } else {
+                    sections.join("\n\n")
+                }
+            } else {
+                "(task has no worktree yet)".to_string()
             };
 
-            if let Some(new_status) = next_status {
-                // Create worktree and tmux window when moving from Backlog to Planning
-                if current_status == TaskStatus::Backlog && new_status == TaskStatus::Planning {
-                    // Sanitize title for worktree/window name
-                    let title_slug: String = task.title
-                        .chars()
-                        .map(|c| if c.is_alphanumeric() || c == '-' || c == '_' { c } else { '-' })
-                        .take(30)
-                        .collect();
-                    let title_slug = title_slug.trim_matches('-').to_string();
-                    let window_name = format!("task-{}", title_slug);
-                    let target = format!("{}:{}", self.state.project_name, window_name);
+            self.state.diff_popup = Some(DiffPopup {
+                task_title: task.title.clone(),
+                diff_content,
+                scroll_offset: 0,
+            });
+        }
+        Ok(())
+    }
 
-                    // Create git worktree from main branch
-                    let worktree_path = git::create_worktree(&project_path, &title_slug)?;
-                    let worktree_path_str = worktree_path.to_string_lossy().to_string();
+    fn move_task_right(&mut self) -> Result<()> {
+        // Clone task to avoid borrow issues
+        let (mut task, project_path) = match (
+            self.state.board.selected_task().cloned(),
+            self.state.project_path.clone(),
+        ) {
+            (Some(t), Some(p)) => (t, p),
+            _ => return Ok(()),
+        };
 
-                    // Build the prompt from task title and description
-                    let prompt = if let Some(desc) = &task.description {
-                        format!("{}\n\n{}", task.title, desc)
-                    } else {
-                        task.title.clone()
-                    };
+        let current_status = task.status;
+        let next_status = match current_status {
+            TaskStatus::Backlog => Some(TaskStatus::Planning),
+            TaskStatus::Planning => Some(TaskStatus::Running),
+            TaskStatus::Running => Some(TaskStatus::Review),
+            TaskStatus::Review => Some(TaskStatus::Done),
+            TaskStatus::Done => None,
+        };
 
-                    // Escape single quotes in prompt for shell
-                    let escaped_prompt = prompt.replace('\'', "'\"'\"'");
+        if let Some(new_status) = next_status {
+            // Create worktree and tmux window when moving from Backlog to Planning
+            if current_status == TaskStatus::Backlog && new_status == TaskStatus::Planning {
+                // Sanitize title for worktree/window name
+                let title_slug: String = task.title
+                    .chars()
+                    .map(|c| if c.is_alphanumeric() || c == '-' || c == '_' { c } else { '-' })
+                    .take(30)
+                    .collect();
+                let title_slug = title_slug.trim_matches('-').to_string();
 
-                    // Create tmux window and start Claude Code with initial prompt
-                    let claude_cmd = format!("claude --dangerously-skip-permissions '{}'", escaped_prompt);
+                // Add task ID prefix to ensure uniqueness (safe slice)
+                let id_prefix: String = task.id.chars().take(8).collect();
+                let unique_slug = format!("{}-{}", id_prefix, title_slug);
+                let window_name = format!("task-{}", unique_slug);
+                let target = format!("{}:{}", self.state.project_name, window_name);
 
-                    std::process::Command::new("tmux")
-                        .args(["-L", tmux::AGENT_SERVER])
-                        .args(["new-window", "-d", "-t", &self.state.project_name, "-n", &window_name])
-                        .args(["-c", &worktree_path_str])
-                        .args(["sh", "-c", &claude_cmd])
-                        .output()?;
-
-                    // Wait briefly for Claude to start and show the bypass warning
-                    std::thread::sleep(std::time::Duration::from_millis(500));
-
-                    // Send "2" to select "Yes, I accept" and Enter to confirm
-                    std::process::Command::new("tmux")
-                        .args(["-L", tmux::AGENT_SERVER])
-                        .args(["send-keys", "-t", &target, "2"])
-                        .output()?;
-                    std::process::Command::new("tmux")
-                        .args(["-L", tmux::AGENT_SERVER])
-                        .args(["send-keys", "-t", &target, "Enter"])
-                        .output()?;
-
-                    task.session_name = Some(target);
-                    task.worktree_path = Some(worktree_path_str);
-                    task.branch_name = Some(format!("task/{}", title_slug));
-                }
-
-                // When moving from Planning to Running, approve the plan to start implementation
-                if current_status == TaskStatus::Planning && new_status == TaskStatus::Running {
-                    if let Some(session_name) = &task.session_name {
-                        // Send Enter to approve the plan and start implementing
-                        std::process::Command::new("tmux")
-                            .args(["-L", tmux::AGENT_SERVER])
-                            .args(["send-keys", "-t", session_name, "Enter"])
-                            .output()?;
+                // Create git worktree from main branch
+                let worktree_path = match git::create_worktree(&project_path, &unique_slug) {
+                    Ok(path) => path,
+                    Err(e) => {
+                        // Log error but don't crash - worktree might already exist
+                        eprintln!("Failed to create worktree: {}", e);
+                        // Try to use existing worktree path
+                        project_path.join(".agtx").join("worktrees").join(&unique_slug)
                     }
+                };
+                let worktree_path_str = worktree_path.to_string_lossy().to_string();
+
+                // Build the prompt from task title and description
+                // Instruct Claude to plan first and wait for approval
+                let task_content = if let Some(desc) = &task.description {
+                    format!("{}\n\n{}", task.title, desc)
+                } else {
+                    task.title.clone()
+                };
+                let prompt = format!(
+                    "Task: {}\n\nPlease analyze this task and create a detailed implementation plan. \
+                    List the files you'll need to modify and the changes you'll make. \
+                    Wait for my approval before making any changes.",
+                    task_content
+                );
+
+                // Escape single quotes in prompt for shell
+                let escaped_prompt = prompt.replace('\'', "'\"'\"'");
+
+                // Create tmux window and start Claude Code
+                let claude_cmd = format!("claude --dangerously-skip-permissions '{}'", escaped_prompt);
+
+                std::process::Command::new("tmux")
+                    .args(["-L", tmux::AGENT_SERVER])
+                    .args(["new-window", "-d", "-t", &self.state.project_name, "-n", &window_name])
+                    .args(["-c", &worktree_path_str])
+                    .args(["sh", "-c", &claude_cmd])
+                    .output()?;
+
+                // Resize the new window to fill the popup area
+                // Using 180 width to maximize horizontal space usage
+                let target = format!("{}:{}", self.state.project_name, window_name);
+                std::process::Command::new("tmux")
+                    .args(["-L", tmux::AGENT_SERVER])
+                    .args(["resize-pane", "-t", &target, "-x", "180", "-y", "50"])
+                    .output()?;
+
+                // Wait for Claude to show the bypass warning prompt, then accept it and rename session
+                // Poll until we see "Yes, I accept" option or timeout after 5 seconds
+                let target_clone = target.clone();
+                let task_id_clone = task.id.clone();
+                std::thread::spawn(move || {
+                    let mut accepted = false;
+                    for _ in 0..50 {
+                        std::thread::sleep(std::time::Duration::from_millis(100));
+
+                        // Check pane content for the bypass prompt
+                        let output = std::process::Command::new("tmux")
+                            .args(["-L", crate::tmux::AGENT_SERVER])
+                            .args(["capture-pane", "-t", &target_clone, "-p"])
+                            .output();
+
+                        if let Ok(output) = output {
+                            let content = String::from_utf8_lossy(&output.stdout);
+                            // Look for the bypass warning prompt options
+                            if content.contains("Yes, I accept") || content.contains("I accept the risk") {
+                                // Found the prompt, send "2" and Enter
+                                let _ = std::process::Command::new("tmux")
+                                    .args(["-L", crate::tmux::AGENT_SERVER])
+                                    .args(["send-keys", "-t", &target_clone, "2"])
+                                    .output();
+                                std::thread::sleep(std::time::Duration::from_millis(50));
+                                let _ = std::process::Command::new("tmux")
+                                    .args(["-L", crate::tmux::AGENT_SERVER])
+                                    .args(["send-keys", "-t", &target_clone, "Enter"])
+                                    .output();
+                                accepted = true;
+                                break;
+                            }
+                        }
+                    }
+
+                    // After accepting, wait for Claude to be ready and rename the session
+                    if accepted {
+                        std::thread::sleep(std::time::Duration::from_millis(1000));
+                        // Send /rename command to name the session with task ID for later resume
+                        let rename_cmd = format!("/rename {}", task_id_clone);
+                        let _ = std::process::Command::new("tmux")
+                            .args(["-L", crate::tmux::AGENT_SERVER])
+                            .args(["send-keys", "-t", &target_clone, &rename_cmd])
+                            .output();
+                        std::thread::sleep(std::time::Duration::from_millis(50));
+                        let _ = std::process::Command::new("tmux")
+                            .args(["-L", crate::tmux::AGENT_SERVER])
+                            .args(["send-keys", "-t", &target_clone, "Enter"])
+                            .output();
+                    }
+                });
+
+                task.session_name = Some(target);
+                task.worktree_path = Some(worktree_path_str);
+                task.branch_name = Some(format!("task/{}", unique_slug));
+            }
+
+            // When moving from Planning to Running, tell Claude to start implementing
+            if current_status == TaskStatus::Planning && new_status == TaskStatus::Running {
+                if let Some(session_name) = &task.session_name {
+                    // Send message to start implementation
+                    std::process::Command::new("tmux")
+                        .args(["-L", tmux::AGENT_SERVER])
+                        .args(["send-keys", "-t", session_name, "Looks good, please proceed with the implementation."])
+                        .output()?;
+                    // Send Enter separately
+                    std::process::Command::new("tmux")
+                        .args(["-L", tmux::AGENT_SERVER])
+                        .args(["send-keys", "-t", session_name, "Enter"])
+                        .output()?;
                 }
+            }
 
-                // When moving from Running to Review: Show PR confirmation popup
-                if current_status == TaskStatus::Running && new_status == TaskStatus::Review {
-                    let task_id = task.id.clone();
-                    let task_title = task.title.clone();
-                    let worktree_path = task.worktree_path.clone();
-                    let branch_name = task.branch_name.clone();
-
-                    // Generate PR description using Claude
-                    let (pr_title, pr_body) = generate_pr_description(
-                        &task_title,
-                        worktree_path.as_deref(),
-                        branch_name.as_deref(),
-                    );
-
-                    // Store task info and show popup
-                    self.state.pr_confirm_popup = Some(PrConfirmPopup {
-                        task_id,
-                        pr_title,
-                        pr_body,
-                        editing_title: true,
-                        generating: false,
+            // When moving from Running to Review: Either create PR or just push if PR exists
+            if current_status == TaskStatus::Running && new_status == TaskStatus::Review {
+                // Check if PR already exists (task was resumed from Review)
+                if task.pr_number.is_some() {
+                    // PR already exists - just commit and push the new changes
+                    self.state.pr_status_popup = Some(PrStatusPopup {
+                        status: PrCreationStatus::Creating,
+                        pr_url: None,
+                        error_message: None,
                     });
-                    // Don't move yet - wait for popup confirmation
+
+                    let task_clone = task.clone();
+                    let project_path_clone = project_path.clone();
+
+                    let (tx, rx) = mpsc::channel();
+                    self.state.pr_creation_rx = Some(rx);
+
+                    std::thread::spawn(move || {
+                        let result = push_changes_to_existing_pr(&task_clone, &project_path_clone);
+                        match result {
+                            Ok(pr_url) => {
+                                // Update task in database
+                                if let Ok(db) = crate::db::Database::open_project(&project_path_clone) {
+                                    let mut updated_task = task_clone;
+                                    updated_task.session_name = None;
+                                    updated_task.status = TaskStatus::Review;
+                                    updated_task.updated_at = chrono::Utc::now();
+                                    let _ = db.update_task(&updated_task);
+                                }
+                                let _ = tx.send(Ok((0, pr_url)));
+                            }
+                            Err(e) => {
+                                let _ = tx.send(Err(e.to_string()));
+                            }
+                        }
+                    });
+
+                    // Kill tmux window
+                    if let Some(session_name) = &task.session_name {
+                        let _ = std::process::Command::new("tmux")
+                            .args(["-L", tmux::AGENT_SERVER])
+                            .args(["kill-window", "-t", session_name])
+                            .output();
+                    }
+
                     return Ok(());
                 }
 
-                // When moving from Review to Done: Check if PR is merged
-                if current_status == TaskStatus::Review && new_status == TaskStatus::Done {
-                    if let Some(pr_number) = task.pr_number {
-                        if !is_pr_merged(pr_number, &project_path)? {
-                            // PR not merged yet - can't move to Done
-                            // TODO: Show error message
+                // No PR yet - show PR creation popup
+                let task_id = task.id.clone();
+                let task_title = task.title.clone();
+                let worktree_path = task.worktree_path.clone();
+
+                // Show popup immediately with loading state
+                self.state.pr_confirm_popup = Some(PrConfirmPopup {
+                    task_id,
+                    pr_title: task_title.clone(),
+                    pr_body: String::new(),
+                    editing_title: true,
+                    generating: true,
+                });
+
+                // Spawn background thread to generate PR description
+                let (tx, rx) = mpsc::channel();
+                self.state.pr_generation_rx = Some(rx);
+
+                let title_for_thread = task_title.clone();
+                let worktree_for_thread = worktree_path.clone();
+                std::thread::spawn(move || {
+                    let (pr_title, pr_body) = generate_pr_description(
+                        &title_for_thread,
+                        worktree_for_thread.as_deref(),
+                        None,
+                    );
+                    let _ = tx.send((pr_title, pr_body));
+                });
+
+                // Don't move yet - wait for popup confirmation
+                return Ok(());
+            }
+
+            // When moving from Review to Done: Check PR state
+            if current_status == TaskStatus::Review && new_status == TaskStatus::Done {
+                if let Some(pr_number) = task.pr_number {
+                    let pr_state = get_pr_state(pr_number, &project_path)?;
+
+                    match pr_state {
+                        PrState::Merged | PrState::Closed => {
+                            // PR is merged or closed - proceed with cleanup
+                        }
+                        PrState::Open => {
+                            // PR still open - ask for confirmation
+                            self.state.done_confirm_popup = Some(DoneConfirmPopup {
+                                task_id: task.id.clone(),
+                                pr_number,
+                            });
                             return Ok(());
                         }
-                        // PR is merged - cleanup resources
-                        // Kill tmux window if exists
-                        if let Some(session_name) = &task.session_name {
-                            let _ = std::process::Command::new("tmux")
-                                .args(["-L", tmux::AGENT_SERVER])
-                                .args(["kill-window", "-t", session_name])
-                                .output();
+                        PrState::Unknown => {
+                            // Can't determine state - ask for confirmation
+                            self.state.done_confirm_popup = Some(DoneConfirmPopup {
+                                task_id: task.id.clone(),
+                                pr_number,
+                            });
+                            return Ok(());
                         }
-
-                        // Remove worktree if exists
-                        if let Some(worktree) = &task.worktree_path {
-                            let _ = std::process::Command::new("git")
-                                .current_dir(&project_path)
-                                .args(["worktree", "remove", "--force", worktree])
-                                .output();
-                        }
-
-                        // Delete local branch if exists
-                        if let Some(branch) = &task.branch_name {
-                            let _ = std::process::Command::new("git")
-                                .current_dir(&project_path)
-                                .args(["branch", "-D", branch])
-                                .output();
-                        }
-
-                        task.session_name = None;
-                        task.worktree_path = None;
-                    } else {
-                        // No PR - can't move to Done without PR being merged
-                        return Ok(());
                     }
-                }
 
-                task.status = new_status;
-                task.updated_at = chrono::Utc::now();
+                    // Cleanup resources
+                    // Kill tmux window if exists
+                    if let Some(session_name) = &task.session_name {
+                        let _ = std::process::Command::new("tmux")
+                            .args(["-L", tmux::AGENT_SERVER])
+                            .args(["kill-window", "-t", session_name])
+                            .output();
+                    }
 
-                if let Some(db) = &self.state.db {
-                    db.update_task(task)?;
+                    // Remove worktree if exists
+                    if let Some(worktree) = &task.worktree_path {
+                        let _ = std::process::Command::new("git")
+                            .current_dir(&project_path)
+                            .args(["worktree", "remove", "--force", worktree])
+                            .output();
+                    }
+
+                    // Keep the branch so task can be reopened later
+
+                    task.session_name = None;
+                    task.worktree_path = None;
+                } else {
+                    // No PR - allow moving to Done (task might have been abandoned early)
+                    // Cleanup any resources that might exist
+                    if let Some(session_name) = &task.session_name {
+                        let _ = std::process::Command::new("tmux")
+                            .args(["-L", tmux::AGENT_SERVER])
+                            .args(["kill-window", "-t", session_name])
+                            .output();
+                    }
+                    if let Some(worktree) = &task.worktree_path {
+                        let _ = std::process::Command::new("git")
+                            .current_dir(&project_path)
+                            .args(["worktree", "remove", "--force", worktree])
+                            .output();
+                    }
+                    // Keep the branch so task can be reopened later
+                    task.session_name = None;
+                    task.worktree_path = None;
                 }
+            }
+
+            task.status = new_status;
+            task.updated_at = chrono::Utc::now();
+
+            if let Some(db) = &self.state.db {
+                db.update_task(&task)?;
             }
         }
         self.refresh_tasks()?;
@@ -1628,8 +2237,8 @@ impl App {
                     return Ok(());
                 }
 
-                // Re-spawn tmux window in existing worktree
-                if let (Some(worktree_path), Some(branch_name)) = (&task.worktree_path, &task.branch_name) {
+                // Re-spawn tmux window in existing worktree, resuming previous Claude session
+                if let (Some(worktree_path), Some(_branch_name)) = (&task.worktree_path, &task.branch_name) {
                     let title_slug: String = task.title
                         .chars()
                         .map(|c| if c.is_alphanumeric() || c == '-' || c == '_' { c } else { '-' })
@@ -1647,8 +2256,12 @@ impl App {
                     );
                     let escaped_prompt = prompt.replace('\'', "'\"'\"'");
 
-                    // Create tmux window in the existing worktree
-                    let claude_cmd = format!("claude --dangerously-skip-permissions '{}'", escaped_prompt);
+                    // Resume previous Claude session using task ID, with new prompt
+                    let claude_cmd = format!(
+                        "claude --resume '{}' --dangerously-skip-permissions '{}'",
+                        task.id,
+                        escaped_prompt
+                    );
 
                     std::process::Command::new("tmux")
                         .args(["-L", tmux::AGENT_SERVER])
@@ -1657,18 +2270,34 @@ impl App {
                         .args(["sh", "-c", &claude_cmd])
                         .output()?;
 
-                    // Wait briefly for Claude to start and show the bypass warning
-                    std::thread::sleep(std::time::Duration::from_millis(500));
+                    // Wait for Claude to show the bypass warning prompt, then accept it
+                    let target_clone = target.clone();
+                    std::thread::spawn(move || {
+                        for _ in 0..50 {
+                            std::thread::sleep(std::time::Duration::from_millis(100));
 
-                    // Send "2" to select "Yes, I accept" and Enter to confirm
-                    std::process::Command::new("tmux")
-                        .args(["-L", tmux::AGENT_SERVER])
-                        .args(["send-keys", "-t", &target, "2"])
-                        .output()?;
-                    std::process::Command::new("tmux")
-                        .args(["-L", tmux::AGENT_SERVER])
-                        .args(["send-keys", "-t", &target, "Enter"])
-                        .output()?;
+                            let output = std::process::Command::new("tmux")
+                                .args(["-L", crate::tmux::AGENT_SERVER])
+                                .args(["capture-pane", "-t", &target_clone, "-p"])
+                                .output();
+
+                            if let Ok(output) = output {
+                                let content = String::from_utf8_lossy(&output.stdout);
+                                if content.contains("Yes, I accept") || content.contains("I accept the risk") {
+                                    let _ = std::process::Command::new("tmux")
+                                        .args(["-L", crate::tmux::AGENT_SERVER])
+                                        .args(["send-keys", "-t", &target_clone, "2"])
+                                        .output();
+                                    std::thread::sleep(std::time::Duration::from_millis(50));
+                                    let _ = std::process::Command::new("tmux")
+                                        .args(["-L", crate::tmux::AGENT_SERVER])
+                                        .args(["send-keys", "-t", &target_clone, "Enter"])
+                                        .output();
+                                    break;
+                                }
+                            }
+                        }
+                    });
 
                     task.session_name = Some(target);
                 }
@@ -1685,6 +2314,23 @@ impl App {
     fn open_selected_task(&mut self) -> Result<()> {
         if let Some(task) = self.state.board.selected_task() {
             if let Some(window_name) = &task.session_name.clone() {
+                // Calculate popup dimensions based on terminal size
+                // Popup is 75% of terminal size, content area is 2 less (for borders)
+                if let Ok((term_width, term_height)) = crossterm::terminal::size() {
+                    let popup_width = (term_width as u32 * 75 / 100) as u16;
+                    let popup_height = (term_height as u32 * 75 / 100) as u16;
+                    let pane_width = popup_width.saturating_sub(2);
+                    let pane_height = popup_height.saturating_sub(4);
+
+                    // Resize tmux pane to match popup dimensions
+                    let _ = std::process::Command::new("tmux")
+                        .args(["-L", tmux::AGENT_SERVER])
+                        .args(["resize-pane", "-t", window_name])
+                        .args(["-x", &pane_width.to_string()])
+                        .args(["-y", &pane_height.to_string()])
+                        .output();
+                }
+
                 // Open shell popup to view/control the detached tmux window
                 self.state.shell_popup = Some(ShellPopup {
                     task_title: task.title.clone(),
@@ -1827,6 +2473,31 @@ fn centered_rect(percent_x: u16, percent_y: u16, r: Rect) -> Rect {
         .split(popup_layout[1])[1]
 }
 
+/// Create a centered popup with fixed width and percentage height
+fn centered_rect_fixed_width(fixed_width: u16, percent_y: u16, r: Rect) -> Rect {
+    // Cap width to terminal width minus some margin
+    let width = fixed_width.min(r.width.saturating_sub(4));
+
+    let popup_layout = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Percentage((100 - percent_y) / 2),
+            Constraint::Percentage(percent_y),
+            Constraint::Percentage((100 - percent_y) / 2),
+        ])
+        .split(r);
+
+    // Calculate horizontal centering
+    let horizontal_margin = r.width.saturating_sub(width) / 2;
+
+    Rect {
+        x: r.x + horizontal_margin,
+        y: popup_layout[1].y,
+        width,
+        height: popup_layout[1].height,
+    }
+}
+
 /// Capture content from a tmux pane (with ANSI escape sequences)
 fn capture_tmux_pane(window_name: &str) -> Vec<u8> {
     std::process::Command::new("tmux")
@@ -1839,28 +2510,50 @@ fn capture_tmux_pane(window_name: &str) -> Vec<u8> {
 
 /// Capture content from a tmux pane with history (with ANSI escape sequences)
 fn capture_tmux_pane_with_history(window_name: &str, history_lines: i32) -> Vec<u8> {
+    // Capture visible pane content plus history
+    // -p: print to stdout
+    // -e: include escape sequences (colors)
+    // -S: start line (negative = history)
+    // -J: join wrapped lines (helps with varying pane widths)
     std::process::Command::new("tmux")
         .args(["-L", tmux::AGENT_SERVER])
-        .args(["capture-pane", "-t", window_name, "-p", "-e"])
-        .args(["-S", &(-history_lines).to_string()])
+        .args(["capture-pane", "-t", window_name, "-p", "-e", "-J"])
+        .args(["-S", &format!("-{}", history_lines)])
         .output()
         .map(|o| o.stdout)
         .unwrap_or_default()
 }
 
 /// Check if a PR is merged
-fn is_pr_merged(pr_number: i32, project_path: &Path) -> Result<bool> {
+/// PR state from GitHub
+#[derive(Debug, Clone, PartialEq)]
+enum PrState {
+    Open,
+    Merged,
+    Closed,
+    Unknown,
+}
+
+fn get_pr_state(pr_number: i32, project_path: &Path) -> Result<PrState> {
     let output = std::process::Command::new("gh")
         .current_dir(project_path)
         .args(["pr", "view", &pr_number.to_string(), "--json", "state"])
         .output()?;
 
     if !output.status.success() {
-        return Ok(false);
+        return Ok(PrState::Unknown);
     }
 
     let stdout = String::from_utf8_lossy(&output.stdout);
-    Ok(stdout.contains("MERGED"))
+    if stdout.contains("MERGED") {
+        Ok(PrState::Merged)
+    } else if stdout.contains("CLOSED") {
+        Ok(PrState::Closed)
+    } else if stdout.contains("OPEN") {
+        Ok(PrState::Open)
+    } else {
+        Ok(PrState::Unknown)
+    }
 }
 
 /// Generate PR title and description using Claude
@@ -1912,13 +2605,50 @@ fn generate_pr_description(task_title: &str, worktree_path: Option<&str>, branch
 
 /// Create a PR with provided title and body, return (pr_number, pr_url)
 fn create_pr_with_content(task: &Task, project_path: &Path, pr_title: &str, pr_body: &str) -> Result<(i32, String)> {
-    // First push the branch
+    let worktree = task.worktree_path.as_deref().unwrap_or(".");
+
+    // Stage all changes
+    std::process::Command::new("git")
+        .current_dir(worktree)
+        .args(["add", "-A"])
+        .output()?;
+
+    // Check if there are changes to commit
+    let status_output = std::process::Command::new("git")
+        .current_dir(worktree)
+        .args(["status", "--porcelain"])
+        .output()?;
+
+    let has_changes = !status_output.stdout.is_empty();
+
+    // Commit if there are staged changes
+    if has_changes {
+        let commit_msg = format!("{}\n\nCo-Authored-By: Claude <noreply@anthropic.com>", pr_title);
+        let commit_output = std::process::Command::new("git")
+            .current_dir(worktree)
+            .args(["commit", "-m", &commit_msg])
+            .output()?;
+
+        if !commit_output.status.success() {
+            let stderr = String::from_utf8_lossy(&commit_output.stderr);
+            // Only fail if it's not "nothing to commit"
+            if !stderr.contains("nothing to commit") {
+                anyhow::bail!("Failed to commit changes: {}", stderr);
+            }
+        }
+    }
+
+    // Push the branch
     if let Some(branch) = &task.branch_name {
-        let worktree = task.worktree_path.as_deref().unwrap_or(".");
-        std::process::Command::new("git")
+        let push_output = std::process::Command::new("git")
             .current_dir(worktree)
             .args(["push", "-u", "origin", branch])
             .output()?;
+
+        if !push_output.status.success() {
+            let stderr = String::from_utf8_lossy(&push_output.stderr);
+            anyhow::bail!("Failed to push branch: {}", stderr);
+        }
     }
 
     // Create PR
@@ -1949,11 +2679,63 @@ fn create_pr_with_content(task: &Task, project_path: &Path, pr_title: &str, pr_b
     Ok((pr_number, pr_url))
 }
 
+/// Push changes to an existing PR (commit and push only, no PR creation)
+fn push_changes_to_existing_pr(task: &Task, _project_path: &Path) -> Result<String> {
+    let worktree = task.worktree_path.as_deref().unwrap_or(".");
+
+    // Stage all changes
+    std::process::Command::new("git")
+        .current_dir(worktree)
+        .args(["add", "-A"])
+        .output()?;
+
+    // Check if there are changes to commit
+    let status_output = std::process::Command::new("git")
+        .current_dir(worktree)
+        .args(["status", "--porcelain"])
+        .output()?;
+
+    let has_changes = !status_output.stdout.is_empty();
+
+    // Commit if there are staged changes
+    if has_changes {
+        let commit_msg = "Address review comments\n\nCo-Authored-By: Claude <noreply@anthropic.com>";
+        let commit_output = std::process::Command::new("git")
+            .current_dir(worktree)
+            .args(["commit", "-m", commit_msg])
+            .output()?;
+
+        if !commit_output.status.success() {
+            let stderr = String::from_utf8_lossy(&commit_output.stderr);
+            if !stderr.contains("nothing to commit") {
+                anyhow::bail!("Failed to commit changes: {}", stderr);
+            }
+        }
+    }
+
+    // Push the branch
+    if let Some(branch) = &task.branch_name {
+        let push_output = std::process::Command::new("git")
+            .current_dir(worktree)
+            .args(["push", "origin", branch])
+            .output()?;
+
+        if !push_output.status.success() {
+            let stderr = String::from_utf8_lossy(&push_output.stderr);
+            anyhow::bail!("Failed to push changes: {}", stderr);
+        }
+    }
+
+    // Return the existing PR URL
+    Ok(task.pr_url.clone().unwrap_or_else(|| "Changes pushed to existing PR".to_string()))
+}
+
 /// Send a key to a tmux pane
 fn send_key_to_tmux(window_name: &str, key: KeyCode) {
     let key_str = match key {
         KeyCode::Char(c) => c.to_string(),
         KeyCode::Enter => "Enter".to_string(),
+        KeyCode::Esc => "Escape".to_string(),
         KeyCode::Backspace => "BSpace".to_string(),
         KeyCode::Tab => "Tab".to_string(),
         KeyCode::Up => "Up".to_string(),
