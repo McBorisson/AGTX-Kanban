@@ -1,5 +1,5 @@
 mod app;
-mod board;
+pub mod board;
 mod input;
 
 pub use app::App;

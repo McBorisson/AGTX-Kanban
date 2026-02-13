@@ -35,6 +35,7 @@ struct AppState {
     board: BoardState,
     input_mode: InputMode,
     input_buffer: String,
+    input_cursor: usize, // Cursor position in input_buffer
     // For task creation/editing
     pending_task_title: String,
     editing_task_id: Option<String>, // Some(id) when editing, None when creating
@@ -219,6 +220,7 @@ impl App {
                 board: BoardState::new(),
                 input_mode: InputMode::Normal,
                 input_buffer: String::new(),
+                input_cursor: 0,
                 pending_task_title: String::new(),
                 editing_task_id: None,
                 db,
@@ -526,15 +528,20 @@ impl App {
             };
 
             // Show title if we're on description step
+            // Insert cursor (█) at the correct position
+            let (before_cursor, after_cursor) = state.input_buffer.split_at(
+                state.input_cursor.min(state.input_buffer.len())
+            );
             let content = if state.input_mode == InputMode::InputDescription {
                 format!(
-                    "Title: {}\n\n{}{}█",
+                    "Title: {}\n\n{}{}█{}",
                     state.pending_task_title,
                     label,
-                    state.input_buffer
+                    before_cursor,
+                    after_cursor
                 )
             } else {
-                format!("{}{}█", label, state.input_buffer)
+                format!("{}{}█{}", label, before_cursor, after_cursor)
             };
 
             let input = Paragraph::new(content)
@@ -1723,6 +1730,7 @@ impl App {
                         // Edit task
                         self.state.editing_task_id = Some(task.id.clone());
                         self.state.input_buffer = task.title.clone();
+                        self.state.input_cursor = self.state.input_buffer.len();
                         self.state.pending_task_title.clear();
                         self.state.input_mode = InputMode::InputTitle;
                     } else if task.session_name.is_some() {
@@ -1761,6 +1769,7 @@ impl App {
             KeyCode::Esc => {
                 self.state.input_mode = InputMode::Normal;
                 self.state.input_buffer.clear();
+                self.state.input_cursor = 0;
                 self.state.pending_task_title.clear();
                 self.state.editing_task_id = None;
             }
@@ -1784,14 +1793,40 @@ impl App {
                         self.state.input_buffer.clear();
                     }
 
+                    self.state.input_cursor = self.state.input_buffer.len();
                     self.state.input_mode = InputMode::InputDescription;
                 }
             }
+            KeyCode::Left => {
+                if self.state.input_cursor > 0 {
+                    self.state.input_cursor -= 1;
+                }
+            }
+            KeyCode::Right => {
+                if self.state.input_cursor < self.state.input_buffer.len() {
+                    self.state.input_cursor += 1;
+                }
+            }
+            KeyCode::Home => {
+                self.state.input_cursor = 0;
+            }
+            KeyCode::End => {
+                self.state.input_cursor = self.state.input_buffer.len();
+            }
             KeyCode::Backspace => {
-                self.state.input_buffer.pop();
+                if self.state.input_cursor > 0 {
+                    self.state.input_cursor -= 1;
+                    self.state.input_buffer.remove(self.state.input_cursor);
+                }
+            }
+            KeyCode::Delete => {
+                if self.state.input_cursor < self.state.input_buffer.len() {
+                    self.state.input_buffer.remove(self.state.input_cursor);
+                }
             }
             KeyCode::Char(c) => {
-                self.state.input_buffer.push(c);
+                self.state.input_buffer.insert(self.state.input_cursor, c);
+                self.state.input_cursor += 1;
             }
             _ => {}
         }
@@ -1809,9 +1844,13 @@ impl App {
                 KeyCode::Enter | KeyCode::Tab => {
                     // Select current match
                     if let Some(selected_file) = search.matches.get(search.selected).cloned() {
-                        // Remove the #pattern from input and insert the file path
+                        // Replace #pattern with the selected file path, preserving text after
+                        let pattern_end = search.start_pos + 1 + search.pattern.len(); // +1 for #
+                        let suffix = self.state.input_buffer[pattern_end..].to_string();
                         self.state.input_buffer.truncate(search.start_pos);
                         self.state.input_buffer.push_str(&selected_file);
+                        self.state.input_cursor = self.state.input_buffer.len();
+                        self.state.input_buffer.push_str(&suffix);
                     }
                     self.state.file_search = None;
                 }
@@ -1839,16 +1878,19 @@ impl App {
                     if search.pattern.is_empty() {
                         // Cancel search if pattern is empty
                         self.state.input_buffer.pop(); // Remove the #
+                        self.state.input_cursor = self.state.input_cursor.saturating_sub(1);
                         self.state.file_search = None;
                     } else {
                         search.pattern.pop();
                         self.state.input_buffer.pop();
+                        self.state.input_cursor = self.state.input_cursor.saturating_sub(1);
                         self.update_file_search_matches();
                     }
                 }
                 KeyCode::Char(c) => {
                     search.pattern.push(c);
                     self.state.input_buffer.push(c);
+                    self.state.input_cursor += 1;
                     self.update_file_search_matches();
                 }
                 _ => {}
@@ -1860,6 +1902,7 @@ impl App {
             KeyCode::Esc => {
                 self.state.input_mode = InputMode::Normal;
                 self.state.input_buffer.clear();
+                self.state.input_cursor = 0;
                 self.state.pending_task_title.clear();
                 self.state.editing_task_id = None;
             }
@@ -1869,22 +1912,49 @@ impl App {
                     // Remove backslash and insert newline
                     self.state.input_buffer.pop();
                     self.state.input_buffer.push('\n');
+                    self.state.input_cursor = self.state.input_buffer.len();
                 } else {
                     // Save task (create or update)
                     self.save_task()?;
                     self.state.input_mode = InputMode::Normal;
                     self.state.input_buffer.clear();
+                    self.state.input_cursor = 0;
                     self.state.pending_task_title.clear();
                     self.state.editing_task_id = None;
                 }
             }
+            KeyCode::Left => {
+                if self.state.input_cursor > 0 {
+                    self.state.input_cursor -= 1;
+                }
+            }
+            KeyCode::Right => {
+                if self.state.input_cursor < self.state.input_buffer.len() {
+                    self.state.input_cursor += 1;
+                }
+            }
+            KeyCode::Home => {
+                self.state.input_cursor = 0;
+            }
+            KeyCode::End => {
+                self.state.input_cursor = self.state.input_buffer.len();
+            }
             KeyCode::Backspace => {
-                self.state.input_buffer.pop();
+                if self.state.input_cursor > 0 {
+                    self.state.input_cursor -= 1;
+                    self.state.input_buffer.remove(self.state.input_cursor);
+                }
+            }
+            KeyCode::Delete => {
+                if self.state.input_cursor < self.state.input_buffer.len() {
+                    self.state.input_buffer.remove(self.state.input_cursor);
+                }
             }
             KeyCode::Char('#') => {
-                // Start file search
-                let start_pos = self.state.input_buffer.len();
-                self.state.input_buffer.push('#');
+                // Start file search at cursor position
+                let start_pos = self.state.input_cursor;
+                self.state.input_buffer.insert(self.state.input_cursor, '#');
+                self.state.input_cursor += 1;
                 self.state.file_search = Some(FileSearchState {
                     pattern: String::new(),
                     matches: vec![],
@@ -1894,7 +1964,8 @@ impl App {
                 self.update_file_search_matches();
             }
             KeyCode::Char(c) => {
-                self.state.input_buffer.push(c);
+                self.state.input_buffer.insert(self.state.input_cursor, c);
+                self.state.input_cursor += 1;
             }
             _ => {}
         }

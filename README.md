@@ -18,14 +18,12 @@ A terminal-native kanban board for managing coding agent sessions with isolated 
 ### Quick Install (recommended)
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/USER/agtx/main/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/fynnfluegge/agtx/main/install.sh | bash
 ```
 
 ### From Source
 
 ```bash
-git clone https://github.com/USER/agtx.git
-cd agtx
 cargo build --release
 cp target/release/agtx ~/.local/bin/
 ```
@@ -33,7 +31,6 @@ cp target/release/agtx ~/.local/bin/
 ### Requirements
 
 - **tmux** - Agent sessions run in a dedicated tmux server
-- **git** - For worktree management
 - **gh** - GitHub CLI for PR operations
 - **claude** - Claude Code CLI (optional, for Claude integration)
 
@@ -47,6 +44,8 @@ agtx
 # Or run in dashboard mode (manage all projects)
 agtx -g
 ```
+
+> [!NOTE] Add `.agtx/` to your project's `.gitignore` to avoid committing worktrees and local task data.
 
 ## Usage
 
@@ -117,13 +116,24 @@ color_description = "#E8909C"
 └─────────────────────────────────────────────────────────┘
                     │           │
                     ▼           ▼
-            ┌───────────────────────────┐
-            │   tmux server "agtx"      │
-            │  ┌───────┐  ┌───────┐     │
-            │  │Claude │  │Claude │     │
-            │  │Task2  │  │Task3  │     │
-            │  └───────┘  └───────┘     │
-            └───────────────────────────┘
+┌─────────────────────────────────────────────────────────┐
+│                 tmux server "agtx"                      │
+│  ┌────────────────────────────────────────────────────┐ │
+│  │ Session: "my-project"                              │ │
+│  │  ┌────────┐  ┌────────┐  ┌────────┐                │ │
+│  │  │Window: │  │Window: │  │Window: │                │ │
+│  │  │task2   │  │task3   │  │task4   │                │ │
+│  │  │(Claude)│  │(Claude)│  │(Claude)│                │ │
+│  │  └────────┘  └────────┘  └────────┘                │ │
+│  └────────────────────────────────────────────────────┘ │
+│  ┌────────────────────────────────────────────────────┐ │
+│  │ Session: "other-project"                           │ │
+│  │  ┌───────────────────┐                             │ │
+│  │  │ Window:           │                             │ │
+│  │  │ some_other_task   │                             │ │
+│  │  └───────────────────┘                             │ │
+│  └────────────────────────────────────────────────────┘ │
+└─────────────────────────────────────────────────────────┘
                     │           │
                     ▼           ▼
             ┌───────────────────────────┐
@@ -133,13 +143,28 @@ color_description = "#E8909C"
             └───────────────────────────┘
 ```
 
+### Tmux Structure
+
+- **Server**: All sessions run on a dedicated tmux server named `agtx`
+- **Sessions**: Each project gets its own tmux session (named after the project)
+- **Windows**: Each task gets its own window within the project's session
+
+```bash
+# List all sessions
+tmux -L agtx list-sessions
+
+# List all windows across sessions
+tmux -L agtx list-windows -a
+
+# Attach to the agtx server
+tmux -L agtx attach
+```
+
 ### Data Storage
 
-- **Database**: `~/Library/Application Support/agtx/` (macOS) or `~/.config/agtx/` (Linux)
+- **Database**: `~/.config/agtx/` (stores task metadata per project)
 - **Worktrees**: `.agtx/worktrees/` in each project
-- **Tmux sessions**: Dedicated server `agtx` (view with `tmux -L agtx ls`)
-
-> **Important**: Add `.agtx/` to your project's `.gitignore` to avoid committing worktrees and local task data.
+- **Tmux**: Dedicated server `agtx` with per-project sessions
 
 ## Development
 
@@ -155,7 +180,3 @@ cargo test
 # Build release
 cargo build --release
 ```
-
-## License
-
-MIT

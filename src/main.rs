@@ -1,10 +1,4 @@
-mod agent;
-mod config;
-mod db;
-mod git;
-mod tmux;
-mod tui;
-
+use agtx::{git, tui, AppMode};
 use anyhow::Result;
 use std::path::PathBuf;
 
@@ -33,10 +27,4 @@ async fn main() -> Result<()> {
     app.run().await?;
 
     Ok(())
-}
-
-#[derive(Debug, Clone)]
-pub enum AppMode {
-    Dashboard,
-    Project(PathBuf),
 }

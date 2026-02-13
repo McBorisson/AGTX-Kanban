@@ -3,7 +3,7 @@ use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
 /// Global configuration (stored in ~/.config/agtx/)
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GlobalConfig {
     /// Default agent for new tasks
     #[serde(default = "default_agent")]
@@ -16,6 +16,16 @@ pub struct GlobalConfig {
     /// UI theme/colors
     #[serde(default)]
     pub theme: ThemeConfig,
+}
+
+impl Default for GlobalConfig {
+    fn default() -> Self {
+        Self {
+            default_agent: default_agent(),
+            worktree: WorktreeConfig::default(),
+            theme: ThemeConfig::default(),
+        }
+    }
 }
 
 /// Theme configuration with hex colors
