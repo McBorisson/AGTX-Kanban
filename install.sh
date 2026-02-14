@@ -2,9 +2,9 @@
 set -e
 
 # agtx installer
-# Usage: curl -fsSL https://raw.githubusercontent.com/USER/agtx/main/install.sh | bash
+# Usage: curl -fsSL https://raw.githubusercontent.com/fynnfluegge/agtx/main/install.sh | bash
 
-REPO="USER/agtx"
+REPO="fynnfluegge/agtx"
 BINARY_NAME="agtx"
 INSTALL_DIR="${AGTX_INSTALL_DIR:-$HOME/.local/bin}"
 
