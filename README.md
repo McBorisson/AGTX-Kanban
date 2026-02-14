@@ -1,13 +1,13 @@
 # agtx
 
-A terminal-native kanban board for managing coding agent sessions with isolated git worktrees.
+#### A terminal-native kanban board for managing coding agent sessions.
 
-![agtx demo](docs/demo.gif)
+![Xnapper-2026-02-14-09 36 33 (1)](https://github.com/user-attachments/assets/fce21a9c-2fe1-4b14-8f24-55e058531370)
 
 ## Features
 
 - **Kanban workflow**: Backlog → Planning → Running → Review → Done
-- **Git worktree isolation**: Each task gets its own worktree, keeping work separated
+- **Git worktree and tmux isolation**: Each task gets its own worktree and tmux window, keeping work separated
 - **Claude Code integration**: Automatic session management with resume capability
 - **PR workflow**: Generate descriptions with AI, create PRs directly from the TUI
 - **Multi-project dashboard**: Manage tasks across all your projects
@@ -15,7 +15,7 @@ A terminal-native kanban board for managing coding agent sessions with isolated 
 
 ## Installation
 
-### Quick Install (recommended)
+### Quick Install
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/fynnfluegge/agtx/main/install.sh | bash
@@ -32,7 +32,7 @@ cp target/release/agtx ~/.local/bin/
 
 - **tmux** - Agent sessions run in a dedicated tmux server
 - **gh** - GitHub CLI for PR operations
-- **claude** - Claude Code CLI (optional, for Claude integration)
+- **claude** - Claude Code CLI
 
 ## Quick Start
 
@@ -45,7 +45,8 @@ agtx
 agtx -g
 ```
 
-> [!NOTE] Add `.agtx/` to your project's `.gitignore` to avoid committing worktrees and local task data.
+> [!NOTE]
+> Add `.agtx/` to your project's `.gitignore` to avoid committing worktrees and local task data.
 
 ## Usage
 
@@ -56,7 +57,7 @@ agtx -g
 | `h/l` or `←/→` | Move between columns |
 | `j/k` or `↑/↓` | Move between tasks |
 | `o` | Create new task |
-| `Enter` | Open task (view Claude session) |
+| `↩` | Open task (view Claude session) |
 | `m` | Move task forward in workflow |
 | `r` | Resume task (Review → Running) |
 | `d` | Show git diff |
