@@ -1,0 +1,409 @@
+use agtx::git;
+use std::path::PathBuf;
+use std::process::Command;
+use tempfile::TempDir;
+
+// =============================================================================
+// Pure function tests (no git repo needed)
+// =============================================================================
+
+#[test]
+fn test_worktree_path() {
+    let project = PathBuf::from("/home/user/project");
+    let path = git::worktree_path(&project, "task-123");
+    assert_eq!(
+        path,
+        PathBuf::from("/home/user/project/.agtx/worktrees/task-123")
+    );
+}
+
+#[test]
+fn test_worktree_path_with_special_chars() {
+    let project = PathBuf::from("/home/user/my-project");
+    let path = git::worktree_path(&project, "fix-bug-456");
+    assert_eq!(
+        path,
+        PathBuf::from("/home/user/my-project/.agtx/worktrees/fix-bug-456")
+    );
+}
+
+#[test]
+fn test_worktree_path_nested_project() {
+    let project = PathBuf::from("/home/user/projects/rust/agtx");
+    let path = git::worktree_path(&project, "feature-abc");
+    assert_eq!(
+        path,
+        PathBuf::from("/home/user/projects/rust/agtx/.agtx/worktrees/feature-abc")
+    );
+}
+
+#[test]
+fn test_worktree_exists_false_for_nonexistent() {
+    let temp_dir = TempDir::new().unwrap();
+    assert!(!git::worktree_exists(temp_dir.path(), "nonexistent-task"));
+}
+
+#[test]
+fn test_worktree_info_task_id() {
+    let info = git::WorktreeInfo {
+        path: PathBuf::from("/project/.agtx/worktrees/task-123"),
+        branch: Some("task/task-123".to_string()),
+        is_bare: false,
+    };
+    assert_eq!(info.task_id(), Some("task-123"));
+}
+
+#[test]
+fn test_worktree_info_task_id_not_agtx_worktree() {
+    // A worktree not in the .agtx/worktrees directory should return None
+    let info = git::WorktreeInfo {
+        path: PathBuf::from("/project/other-worktree"),
+        branch: Some("feature-branch".to_string()),
+        is_bare: false,
+    };
+    assert_eq!(info.task_id(), None);
+}
+
+#[test]
+fn test_worktree_info_bare() {
+    let info = git::WorktreeInfo {
+        path: PathBuf::from("/project"),
+        branch: None,
+        is_bare: true,
+    };
+    assert!(info.is_bare);
+    assert!(info.branch.is_none());
+}
+
+// =============================================================================
+// Integration tests (require git)
+// =============================================================================
+
+fn setup_git_repo() -> TempDir {
+    let temp_dir = TempDir::new().unwrap();
+
+    // Initialize git repo
+    Command::new("git")
+        .current_dir(temp_dir.path())
+        .args(["init"])
+        .output()
+        .expect("Failed to init git repo");
+
+    // Configure git user for commits
+    Command::new("git")
+        .current_dir(temp_dir.path())
+        .args(["config", "user.email", "test@test.com"])
+        .output()
+        .expect("Failed to config git email");
+
+    Command::new("git")
+        .current_dir(temp_dir.path())
+        .args(["config", "user.name", "Test User"])
+        .output()
+        .expect("Failed to config git name");
+
+    // Create initial commit (needed for worktrees)
+    std::fs::write(temp_dir.path().join("README.md"), "# Test").unwrap();
+
+    Command::new("git")
+        .current_dir(temp_dir.path())
+        .args(["add", "."])
+        .output()
+        .expect("Failed to add files");
+
+    Command::new("git")
+        .current_dir(temp_dir.path())
+        .args(["commit", "-m", "Initial commit"])
+        .output()
+        .expect("Failed to commit");
+
+    // Rename branch to main (in case default is master)
+    Command::new("git")
+        .current_dir(temp_dir.path())
+        .args(["branch", "-M", "main"])
+        .output()
+        .expect("Failed to rename branch");
+
+    temp_dir
+}
+
+#[test]
+fn test_is_git_repo_true() {
+    let temp_dir = setup_git_repo();
+    assert!(git::is_git_repo(temp_dir.path()));
+}
+
+#[test]
+fn test_is_git_repo_false() {
+    let temp_dir = TempDir::new().unwrap();
+    assert!(!git::is_git_repo(temp_dir.path()));
+}
+
+#[test]
+fn test_repo_root() {
+    let temp_dir = setup_git_repo();
+    let root = git::repo_root(temp_dir.path()).unwrap();
+    // Canonicalize both paths to handle macOS /var -> /private/var symlink
+    let expected = temp_dir.path().canonicalize().unwrap();
+    let actual = root.canonicalize().unwrap();
+    assert_eq!(actual, expected);
+}
+
+#[test]
+fn test_current_branch() {
+    let temp_dir = setup_git_repo();
+    let branch = git::current_branch(temp_dir.path()).unwrap();
+    assert_eq!(branch, "main");
+}
+
+#[test]
+fn test_create_and_remove_worktree() {
+    let temp_dir = setup_git_repo();
+
+    // Create worktree
+    let worktree_path = git::create_worktree(temp_dir.path(), "test-task").unwrap();
+
+    // Verify it exists
+    assert!(worktree_path.exists());
+    assert!(worktree_path.join(".git").exists());
+    assert!(git::worktree_exists(temp_dir.path(), "test-task"));
+
+    // List worktrees should include it
+    let worktrees = git::list_worktrees(temp_dir.path()).unwrap();
+    assert!(worktrees.len() >= 2); // main + our worktree
+
+    // Canonicalize paths to handle macOS /var -> /private/var symlink
+    let worktree_path_canonical = worktree_path.canonicalize().unwrap();
+    let task_worktree = worktrees.iter().find(|w| {
+        w.path.canonicalize().ok() == Some(worktree_path_canonical.clone())
+    });
+    assert!(task_worktree.is_some());
+    assert_eq!(task_worktree.unwrap().branch, Some("task/test-task".to_string()));
+
+    // Remove worktree
+    git::remove_worktree(temp_dir.path(), "test-task").unwrap();
+
+    // Verify it's gone
+    assert!(!worktree_path.exists());
+}
+
+#[test]
+fn test_create_worktree_idempotent() {
+    let temp_dir = setup_git_repo();
+
+    // Create worktree twice - should succeed both times
+    let path1 = git::create_worktree(temp_dir.path(), "idempotent-task").unwrap();
+    let path2 = git::create_worktree(temp_dir.path(), "idempotent-task").unwrap();
+
+    assert_eq!(path1, path2);
+    assert!(path1.exists());
+}
+
+#[test]
+fn test_list_worktrees_empty_repo() {
+    let temp_dir = setup_git_repo();
+
+    // Should have at least the main worktree
+    let worktrees = git::list_worktrees(temp_dir.path()).unwrap();
+    assert!(!worktrees.is_empty());
+
+    // Main worktree should have branch "main"
+    let main_worktree = worktrees.iter().find(|w| w.branch == Some("main".to_string()));
+    assert!(main_worktree.is_some());
+}
+
+// =============================================================================
+// Error case tests
+// =============================================================================
+
+/// Setup a git repo with "master" as the default branch (instead of "main")
+fn setup_git_repo_with_master() -> TempDir {
+    let temp_dir = TempDir::new().unwrap();
+
+    Command::new("git")
+        .current_dir(temp_dir.path())
+        .args(["init"])
+        .output()
+        .expect("Failed to init git repo");
+
+    Command::new("git")
+        .current_dir(temp_dir.path())
+        .args(["config", "user.email", "test@test.com"])
+        .output()
+        .expect("Failed to config git email");
+
+    Command::new("git")
+        .current_dir(temp_dir.path())
+        .args(["config", "user.name", "Test User"])
+        .output()
+        .expect("Failed to config git name");
+
+    std::fs::write(temp_dir.path().join("README.md"), "# Test").unwrap();
+
+    Command::new("git")
+        .current_dir(temp_dir.path())
+        .args(["add", "."])
+        .output()
+        .expect("Failed to add files");
+
+    Command::new("git")
+        .current_dir(temp_dir.path())
+        .args(["commit", "-m", "Initial commit"])
+        .output()
+        .expect("Failed to commit");
+
+    // Rename branch to master (not main)
+    Command::new("git")
+        .current_dir(temp_dir.path())
+        .args(["branch", "-M", "master"])
+        .output()
+        .expect("Failed to rename branch");
+
+    temp_dir
+}
+
+#[test]
+fn test_create_worktree_with_master_branch() {
+    let temp_dir = setup_git_repo_with_master();
+
+    // Should detect master and create worktree from it
+    let worktree_path = git::create_worktree(temp_dir.path(), "master-task").unwrap();
+
+    assert!(worktree_path.exists());
+    assert!(worktree_path.join(".git").exists());
+
+    // Verify branch was created
+    let worktrees = git::list_worktrees(temp_dir.path()).unwrap();
+    let task_worktree = worktrees.iter().find(|w| {
+        w.branch == Some("task/master-task".to_string())
+    });
+    assert!(task_worktree.is_some());
+}
+
+#[test]
+fn test_create_worktree_on_non_git_directory() {
+    let temp_dir = TempDir::new().unwrap();
+    // Don't initialize git - just a plain directory
+
+    let result = git::create_worktree(temp_dir.path(), "should-fail");
+
+    assert!(result.is_err());
+}
+
+#[test]
+fn test_remove_worktree_nonexistent() {
+    let temp_dir = setup_git_repo();
+
+    // Removing a non-existent worktree should not panic
+    // (it may return Ok or Err depending on git version, but shouldn't crash)
+    let result = git::remove_worktree(temp_dir.path(), "does-not-exist");
+
+    // The function should complete without panicking
+    // We don't assert success/failure since behavior may vary
+    let _ = result;
+}
+
+#[test]
+fn test_list_worktrees_on_non_git_directory() {
+    let temp_dir = TempDir::new().unwrap();
+    // Don't initialize git
+
+    let result = git::list_worktrees(temp_dir.path());
+
+    // Should return error or empty list, not panic
+    assert!(result.is_err() || result.unwrap().is_empty());
+}
+
+#[test]
+fn test_is_git_repo_nonexistent_path() {
+    let path = PathBuf::from("/nonexistent/path/that/does/not/exist");
+    assert!(!git::is_git_repo(&path));
+}
+
+#[test]
+fn test_current_branch_non_git_directory() {
+    let temp_dir = TempDir::new().unwrap();
+    // Don't initialize git
+
+    let result = git::current_branch(temp_dir.path());
+
+    // Should return error, not panic
+    // Note: git returns empty string for non-git dirs, which might be Ok("")
+    // So we just verify it doesn't panic
+    let _ = result;
+}
+
+#[test]
+fn test_create_multiple_worktrees() {
+    let temp_dir = setup_git_repo();
+
+    // Create multiple worktrees
+    let path1 = git::create_worktree(temp_dir.path(), "task-1").unwrap();
+    let path2 = git::create_worktree(temp_dir.path(), "task-2").unwrap();
+    let path3 = git::create_worktree(temp_dir.path(), "task-3").unwrap();
+
+    assert!(path1.exists());
+    assert!(path2.exists());
+    assert!(path3.exists());
+
+    // All should be different paths
+    assert_ne!(path1, path2);
+    assert_ne!(path2, path3);
+    assert_ne!(path1, path3);
+
+    // List should show all of them
+    let worktrees = git::list_worktrees(temp_dir.path()).unwrap();
+    assert!(worktrees.len() >= 4); // main + 3 tasks
+
+    // Clean up
+    git::remove_worktree(temp_dir.path(), "task-1").unwrap();
+    git::remove_worktree(temp_dir.path(), "task-2").unwrap();
+    git::remove_worktree(temp_dir.path(), "task-3").unwrap();
+
+    assert!(!path1.exists());
+    assert!(!path2.exists());
+    assert!(!path3.exists());
+}
+
+#[test]
+fn test_worktree_with_uncommitted_changes() {
+    let temp_dir = setup_git_repo();
+
+    // Create worktree
+    let worktree_path = git::create_worktree(temp_dir.path(), "dirty-task").unwrap();
+
+    // Make uncommitted changes in the worktree
+    std::fs::write(worktree_path.join("dirty-file.txt"), "uncommitted content").unwrap();
+
+    // Remove should still work (with --force)
+    let result = git::remove_worktree(temp_dir.path(), "dirty-task");
+    assert!(result.is_ok());
+}
+
+#[test]
+fn test_worktree_info_task_id_edge_cases() {
+    // Test with path that has "worktrees" but not ".agtx"
+    let info = git::WorktreeInfo {
+        path: PathBuf::from("/project/worktrees/task-123"),
+        branch: Some("task/task-123".to_string()),
+        is_bare: false,
+    };
+    // Parent is "worktrees" so it should match
+    assert_eq!(info.task_id(), Some("task-123"));
+
+    // Test with deeply nested path
+    let info2 = git::WorktreeInfo {
+        path: PathBuf::from("/a/b/c/.agtx/worktrees/deep-task"),
+        branch: None,
+        is_bare: false,
+    };
+    assert_eq!(info2.task_id(), Some("deep-task"));
+
+    // Test with root path
+    let info3 = git::WorktreeInfo {
+        path: PathBuf::from("/"),
+        branch: None,
+        is_bare: false,
+    };
+    assert_eq!(info3.task_id(), None);
+}

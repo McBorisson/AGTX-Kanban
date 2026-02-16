@@ -1,6 +1,6 @@
 # AGTX - Terminal Kanban for Coding Agents
 
-A terminal-native kanban board for managing multiple coding agent sessions (Claude Code, Aider, etc.) with isolated git worktrees.
+A terminal-native kanban board for managing multiple coding agent sessions (Claude Code, Codex, etc.) with isolated git worktrees.
 
 ## Quick Start
 
@@ -20,6 +20,7 @@ cargo build --release
 ```
 src/
 ├── main.rs           # Entry point, CLI arg parsing, AppMode enum
+├── lib.rs            # Module exports for integration tests
 ├── tui/
 │   ├── mod.rs        # Re-exports
 │   ├── app.rs        # Main App struct, event loop, rendering (largest file)
@@ -36,8 +37,16 @@ src/
 │   └── worktree.rs   # Git worktree create/remove/list
 ├── agent/
 │   └── mod.rs        # Agent definitions, detection, spawn args
-└── config/
-    └── mod.rs        # GlobalConfig, ProjectConfig, ThemeConfig, MergedConfig
+├── config/
+│   └── mod.rs        # GlobalConfig, ProjectConfig, ThemeConfig
+└── operations.rs     # Traits for tmux/git operations (for testing)
+
+tests/
+├── db_tests.rs       # Database and model tests
+├── config_tests.rs   # Configuration tests
+├── board_tests.rs    # Board navigation tests
+├── git_tests.rs      # Git worktree tests
+└── workflow_tests.rs # Task workflow tests
 ```
 
 ## Key Concepts
@@ -46,21 +55,21 @@ src/
 ```
 Backlog → Planning → Running → Review → Done
             ↓           ↓         ↓        ↓
-         worktree    Claude    PR opens  cleanup
-         + Claude    working   (can      (keep
-         planning             resume)    branch)
+         worktree    Claude    optional  cleanup
+         + Claude    working   PR        (keep
+         planning             (resume)   branch)
 ```
 
 - **Backlog**: Task ideas, not started
 - **Planning**: Creates git worktree at `.agtx/worktrees/{slug}`, starts Claude Code in planning mode
 - **Running**: Claude is implementing (sends "proceed with implementation")
-- **Review**: PR is opened. Can move back to Running to address feedback (resumes Claude session)
-- **Done**: PR merged/closed, cleanup worktree + tmux (branch kept for potential reopen)
+- **Review**: Optionally create PR. Tmux window stays open. Can resume to address feedback
+- **Done**: Cleanup worktree + tmux window (branch kept locally)
 
-### Claude Session Resume
-- When Claude starts, session is renamed with `/rename {task_id}`
-- When resuming from Review → Running, uses `claude --resume {task_id}`
-- This preserves full conversation context across task lifecycle
+### Session Persistence
+- Tmux window stays open when moving Running → Review
+- Resume from Review simply changes status back to Running (window already exists)
+- No special Claude resume logic needed - the session just stays alive in tmux
 
 ### Database Storage
 All databases stored centrally (not in project directories):
@@ -72,21 +81,46 @@ Structure:
 - `projects/{hash}.db` - Per-project task database (hash of project path)
 
 ### Tmux Architecture
-- All agent sessions run in tmux server named `agtx` (`tmux -L agtx`)
-- Window naming: `{project}:task-{title_slug}`
+```
+┌─────────────────────────────────────────────────────────┐
+│                 tmux server "agtx"                      │
+│  ┌────────────────────────────────────────────────────┐ │
+│  │ Session: "my-project"                              │ │
+│  │  ┌────────┐  ┌────────┐  ┌────────┐                │ │
+│  │  │Window: │  │Window: │  │Window: │                │ │
+│  │  │task2   │  │task3   │  │task4   │                │ │
+│  │  │(Claude)│  │(Claude)│  │(Claude)│                │ │
+│  │  └────────┘  └────────┘  └────────┘                │ │
+│  └────────────────────────────────────────────────────┘ │
+│  ┌────────────────────────────────────────────────────┐ │
+│  │ Session: "other-project"                           │ │
+│  │  ┌───────────────────┐                             │ │
+│  │  │ Window:           │                             │ │
+│  │  │ some_other_task   │                             │ │
+│  │  └───────────────────┘                             │ │
+│  └────────────────────────────────────────────────────┘ │
+└─────────────────────────────────────────────────────────┘
+```
+
+- **Server**: Dedicated tmux server named `agtx` (`tmux -L agtx`)
+- **Sessions**: Each project gets its own session (named after project)
+- **Windows**: Each task gets its own window within the project's session
 - Separate from user's regular tmux sessions
-- View sessions: `tmux -L agtx list-windows`
+- View sessions: `tmux -L agtx list-windows -a`
+- Attach: `tmux -L agtx attach`
 
 ### Theme Configuration
 Colors configurable via `~/.config/agtx/config.toml`:
 ```toml
 [theme]
-color_selected = "#FFFF99"     # Selected elements (light yellow)
-color_normal = "#00FFFF"       # Normal borders (cyan)
-color_dimmed = "#666666"       # Inactive elements (gray)
-color_text = "#FFFFFF"         # Text (white)
-color_accent = "#00FFFF"       # Accents (cyan)
-color_description = "#E8909C"  # Task descriptions (rose)
+color_selected = "#FFFF99"      # Selected elements (light yellow)
+color_normal = "#00FFFF"        # Normal borders (cyan)
+color_dimmed = "#666666"        # Inactive elements (gray)
+color_text = "#FFFFFF"          # Text (white)
+color_accent = "#00FFFF"        # Accents (cyan)
+color_description = "#E8909C"   # Task descriptions (rose)
+color_popup_border = "#00FF00"  # Popup borders (green)
+color_popup_header = "#00FFFF"  # Popup headers (cyan)
 ```
 
 ## Keyboard Shortcuts
@@ -97,9 +131,8 @@ color_description = "#E8909C"  # Task descriptions (rose)
 | `h/l` or arrows | Move between columns |
 | `j/k` or arrows | Move between tasks |
 | `o` | Create new task |
-| `Enter` | Open task popup (tmux view) |
-| `i` | Edit task (backlog only) |
-| `x` | Delete task |
+| `Enter` | Open task popup (tmux view) / Edit task (backlog) |
+| `x` | Delete task (with confirmation) |
 | `d` | Show git diff for task |
 | `m` | Move task forward (advance workflow) |
 | `r` | Resume task (Review → Running) |
@@ -110,9 +143,10 @@ color_description = "#E8909C"  # Task descriptions (rose)
 ### Task Popup (tmux view)
 | Key | Action |
 |-----|--------|
-| `Ctrl+j/k` | Scroll up/down |
+| `Ctrl+j/k` or `Ctrl+n/p` | Scroll up/down |
+| `Ctrl+d/u` | Page down/up |
 | `Ctrl+g` | Jump to bottom |
-| `Ctrl+q` | Close popup |
+| `Ctrl+q` or `Esc` | Close popup |
 | Other keys | Forwarded to tmux/Claude |
 
 ### PR Creation Popup
@@ -121,6 +155,14 @@ color_description = "#E8909C"  # Task descriptions (rose)
 | `Tab` | Switch between title/description |
 | `Ctrl+s` | Create PR and move to Review |
 | `Esc` | Cancel |
+
+### Task Edit (Description)
+| Key | Action |
+|-----|--------|
+| `#` | Start file search (fuzzy find) |
+| `\` + Enter | Line continuation (multi-line) |
+| Arrow keys | Move cursor |
+| `Home/End` | Jump to start/end |
 
 ## Code Patterns
 
@@ -149,12 +191,18 @@ color_description = "#E8909C"  # Task descriptions (rose)
 ### Claude Integration
 - Uses `--dangerously-skip-permissions` flag
 - Polls tmux pane for "Yes, I accept" prompt before sending acceptance
-- Sends `/rename {task_id}` after Claude starts for session resume capability
 
-## Building
+## Building & Testing
 
 ```bash
+# Build
 cargo build --release
+
+# Run tests
+cargo test
+
+# Run tests with mock support
+cargo test --features test-mocks
 ```
 
 Dependencies require:
@@ -164,12 +212,6 @@ Dependencies require:
 - git (runtime dependency)
 - gh CLI (for PR operations)
 - claude CLI (Claude Code)
-
-## Testing
-
-```bash
-cargo test
-```
 
 ## Common Tasks
 
@@ -197,12 +239,20 @@ cargo test
 ### Adding a new popup
 1. Add state struct (e.g., `MyPopup`) in app.rs
 2. Add `Option<MyPopup>` field to `AppState`
-3. Add rendering in `draw_board()` function
-4. Add key handler function `handle_my_popup_key()`
-5. Add check in `handle_key()` to route to handler
+3. Initialize to `None` in `App::new()`
+4. Add rendering in `draw_board()` function
+5. Add key handler function `handle_my_popup_key()`
+6. Add check in `handle_key()` to route to handler
+
+## Planning Docs
+
+See `docs/planning/` for future enhancements:
+- `codex-cli-integration.md` - Plan for Codex CLI agent support
+- `dependency-injection-testing.md` - Plan for improved test coverage
+- `tmux-popup-focus-bug.md` - Known issue with tmux attachment
 
 ## Future Enhancements
 - Auto-detect Claude idle status (show spinner when working)
 - Reopen Done tasks (recreate worktree from preserved branch)
-- Support for additional agents (Aider, Codex)
+- Support for additional agents (Aider, Codex, GitHub Copilot CLI)
 - Notification when Claude finishes work

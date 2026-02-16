@@ -1,4 +1,3 @@
-use anyhow::Result;
 use serde::{Deserialize, Serialize};
 
 /// Known coding agents that agtx can work with
@@ -110,29 +109,4 @@ pub fn build_spawn_args(agent: &Agent, prompt: &str, task_id: &str) -> Vec<Strin
     }
 
     args
-}
-
-/// Build command for resuming an agent session
-pub fn build_resume_args(agent: &Agent, task_id: &str) -> Result<Vec<String>> {
-    let mut args = agent.args.clone();
-
-    match agent.name.as_str() {
-        "claude" => {
-            // Claude Code supports --resume
-            args.extend([
-                "--resume".to_string(),
-                "--session".to_string(),
-                task_id.to_string(),
-            ]);
-        }
-        "aider" => {
-            // Aider auto-resumes from .aider.chat.history.md in the directory
-            // No special flags needed
-        }
-        _ => {
-            anyhow::bail!("Agent '{}' does not support session resumption", agent.name);
-        }
-    }
-
-    Ok(args)
 }

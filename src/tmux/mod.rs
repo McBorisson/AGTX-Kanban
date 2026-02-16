@@ -155,20 +155,3 @@ impl SessionInfo {
         self.name.split("--").nth(1)
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_session_info_parsing() {
-        let info = SessionInfo {
-            name: "task-abc12345--my-project--fix-auth".to_string(),
-            last_activity: 0,
-            created: 0,
-        };
-
-        assert_eq!(info.task_id(), Some("abc12345"));
-        assert_eq!(info.project_name(), Some("my-project"));
-    }
-}

@@ -197,18 +197,3 @@ impl WorktreeInfo {
             })
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_worktree_path() {
-        let project = PathBuf::from("/home/user/project");
-        let path = worktree_path(&project, "task-123");
-        assert_eq!(
-            path,
-            PathBuf::from("/home/user/project/.agtx/worktrees/task-123")
-        );
-    }
-}
