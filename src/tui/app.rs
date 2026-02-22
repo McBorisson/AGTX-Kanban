@@ -28,6 +28,26 @@ fn hex_to_color(hex: &str) -> Color {
         .unwrap_or(Color::White)
 }
 
+/// Build footer help text based on current UI state
+fn build_footer_text(input_mode: InputMode, sidebar_focused: bool, selected_column: usize) -> String {
+    match input_mode {
+        InputMode::Normal => {
+            if sidebar_focused {
+                " [j/k] navigate  [Enter] open  [l] board  [e] hide sidebar  [q] quit ".to_string()
+            } else {
+                match selected_column {
+                    0 => " [o] new  [/] search  [Enter] open  [x] del  [d] diff  [m] plan  [M] run  [e] sidebar  [q] quit".to_string(),
+                    1 => " [o] new  [/] search  [Enter] open  [x] del  [d] diff  [m] run  [e] sidebar  [q] quit".to_string(),
+                    2 | 3 => " [o] new  [/] search  [Enter] open  [x] del  [d] diff  [m] move  [r] move left  [e] sidebar  [q] quit".to_string(),
+                    _ => " [o] new  [/] search  [Enter] open  [x] del  [e] sidebar  [q] quit".to_string(),
+                }
+            }
+        }
+        InputMode::InputTitle => " Enter task title... [Esc] cancel [Enter] next ".to_string(),
+        InputMode::InputDescription => " Enter prompt for agent... [#] file search [Esc] cancel [\\+Enter] newline [Enter] save ".to_string(),
+    }
+}
+
 type Terminal = ratatui::Terminal<CrosstermBackend<Stdout>>;
 
 /// Shell popup dimensions - used for both rendering and tmux window sizing
@@ -535,23 +555,7 @@ impl App {
         }
 
         // Footer with help
-        let footer_text = match state.input_mode {
-            InputMode::Normal => {
-                if state.sidebar_focused {
-                    " [j/k] navigate  [Enter] open  [l] board  [e] hide sidebar  [q] quit ".to_string()
-                } else {
-                    // Show [r] resume only when Review column is focused
-                    let is_review_column = state.board.selected_column == 3; // Review is index 3
-                    if is_review_column {
-                        " [o] new  [/] search  [Enter] open  [x] del  [d] diff  [m] move  [r] resume  [e] sidebar  [q] quit".to_string()
-                    } else {
-                        " [o] new  [/] search  [Enter] open  [x] del  [d] diff  [m] move  [e] sidebar  [q] quit".to_string()
-                    }
-                }
-            }
-            InputMode::InputTitle => " Enter task title... [Esc] cancel [Enter] next ".to_string(),
-            InputMode::InputDescription => " Enter prompt for agent... [#] file search [Esc] cancel [\\+Enter] newline [Enter] save ".to_string(),
-        };
+        let footer_text = build_footer_text(state.input_mode, state.sidebar_focused, state.board.selected_column);
 
         let footer = Paragraph::new(footer_text.as_str())
             .style(Style::default().fg(hex_to_color(&state.config.theme.color_dimmed)))
@@ -1852,12 +1856,16 @@ impl App {
             KeyCode::Char('x') => self.delete_selected_task()?,
             KeyCode::Char('d') => self.show_task_diff()?,
             KeyCode::Char('m') => self.move_task_right()?,
+            KeyCode::Char('M') => self.move_backlog_to_running()?,
             KeyCode::Char('r') => {
-                // Move Review task back to Running (for PR changes)
                 if let Some(task) = self.state.board.selected_task() {
-                    if task.status == TaskStatus::Review {
-                        let task_id = task.id.clone();
-                        self.move_review_to_running(&task_id)?;
+                    let task_id = task.id.clone();
+                    match task.status {
+                        // Move Review task back to Running (for PR changes)
+                        TaskStatus::Review => self.move_review_to_running(&task_id)?,
+                        // Move Running task back to Planning
+                        TaskStatus::Running => self.move_running_to_planning(&task_id)?,
+                        _ => {}
                     }
                 }
             }
@@ -2219,34 +2227,6 @@ impl App {
         if let Some(new_status) = next_status {
             // Create worktree and tmux window when moving from Backlog to Planning
             if current_status == TaskStatus::Backlog && new_status == TaskStatus::Planning {
-                let unique_slug = generate_task_slug(&task.id, &task.title);
-                let window_name = format!("task-{}", unique_slug);
-                let target = format!("{}:{}", self.state.project_name, window_name);
-
-                // Create git worktree from main branch
-                let worktree_path_str = match self.state.git_ops.create_worktree(&project_path, &unique_slug) {
-                    Ok(path) => path,
-                    Err(e) => {
-                        // Log error but don't crash - worktree might already exist
-                        eprintln!("Failed to create worktree: {}", e);
-                        // Try to use existing worktree path
-                        project_path.join(".agtx").join("worktrees").join(&unique_slug)
-                            .to_string_lossy().to_string()
-                    }
-                };
-
-                // Initialize worktree: copy files and run init script
-                let worktree_path = Path::new(&worktree_path_str);
-                let init_warnings = self.state.git_ops.initialize_worktree(
-                    &project_path,
-                    worktree_path,
-                    self.state.config.copy_files.clone(),
-                    self.state.config.init_script.clone(),
-                );
-                for warning in &init_warnings {
-                    eprintln!("Worktree init: {}", warning);
-                }
-
                 // Build the prompt from task title and description
                 // Instruct agent to plan first and wait for approval
                 let task_content = if let Some(desc) = &task.description {
@@ -2261,18 +2241,15 @@ impl App {
                     task_content
                 );
 
-                // Get the default agent and build the interactive command
-                let agent = agent::default_agent().unwrap_or_else(|| agent::get_agent("claude").unwrap());
-                let agent_cmd = agent.build_interactive_command(&prompt);
-
-                // Ensure project tmux session exists
-                ensure_project_tmux_session(&self.state.project_name, &project_path, self.state.tmux_ops.as_ref());
-
-                self.state.tmux_ops.create_window(
+                let target = setup_task_worktree(
+                    &mut task,
+                    &project_path,
                     &self.state.project_name,
-                    &window_name,
-                    &worktree_path_str,
-                    Some(agent_cmd),
+                    &prompt,
+                    self.state.config.copy_files.clone(),
+                    self.state.config.init_script.clone(),
+                    self.state.tmux_ops.as_ref(),
+                    self.state.git_ops.as_ref(),
                 )?;
 
                 // Wait for agent to show the bypass warning prompt, then accept it and rename session
@@ -2307,10 +2284,6 @@ impl App {
                         let _ = tmux_ops.send_keys(&target_clone, &rename_cmd);
                     }
                 });
-
-                task.session_name = Some(target);
-                task.worktree_path = Some(worktree_path_str);
-                task.branch_name = Some(format!("task/{}", unique_slug));
             }
 
             // When moving from Planning to Running, tell agent to start implementing
@@ -2413,6 +2386,79 @@ impl App {
         Ok(())
     }
 
+    /// Move task directly from Backlog to Running (skip Planning)
+    fn move_backlog_to_running(&mut self) -> Result<()> {
+        let (mut task, project_path) = match (
+            self.state.board.selected_task().cloned(),
+            self.state.project_path.clone(),
+        ) {
+            (Some(t), Some(p)) => (t, p),
+            _ => return Ok(()),
+        };
+
+        if task.status != TaskStatus::Backlog {
+            return Ok(());
+        }
+
+        // Build prompt - skip planning, go straight to implementation
+        let task_content = if let Some(desc) = &task.description {
+            format!("{}\n\n{}", task.title, desc)
+        } else {
+            task.title.clone()
+        };
+        let prompt = format!(
+            "Task: {}\n\nPlease implement this task directly. No need to plan first - go ahead and make the changes.",
+            task_content
+        );
+
+        let target = setup_task_worktree(
+            &mut task,
+            &project_path,
+            &self.state.project_name,
+            &prompt,
+            self.state.config.copy_files.clone(),
+            self.state.config.init_script.clone(),
+            self.state.tmux_ops.as_ref(),
+            self.state.git_ops.as_ref(),
+        )?;
+
+        // Wait for agent to show the bypass warning prompt, then accept it and rename session
+        let target_clone = target.clone();
+        let task_id_clone = task.id.clone();
+        let tmux_ops = Arc::clone(&self.state.tmux_ops);
+        std::thread::spawn(move || {
+            let mut accepted = false;
+            for _ in 0..50 {
+                std::thread::sleep(std::time::Duration::from_millis(100));
+
+                if let Ok(content) = tmux_ops.capture_pane(&target_clone) {
+                    if content.contains("Yes, I accept") || content.contains("I accept the risk") {
+                        let _ = tmux_ops.send_keys_literal(&target_clone, "2");
+                        std::thread::sleep(std::time::Duration::from_millis(50));
+                        let _ = tmux_ops.send_keys_literal(&target_clone, "Enter");
+                        accepted = true;
+                        break;
+                    }
+                }
+            }
+
+            if accepted {
+                std::thread::sleep(std::time::Duration::from_millis(1000));
+                let rename_cmd = format!("/rename {}", task_id_clone);
+                let _ = tmux_ops.send_keys(&target_clone, &rename_cmd);
+            }
+        });
+
+        task.status = TaskStatus::Running;
+        task.updated_at = chrono::Utc::now();
+
+        if let Some(db) = &self.state.db {
+            db.update_task(&task)?;
+        }
+        self.refresh_tasks()?;
+        Ok(())
+    }
+
     /// Move task from Review back to Running (only allowed transition backwards)
     /// The tmux window should still be open from when it was in Running state
     fn move_review_to_running(&mut self, task_id: &str) -> Result<()> {
@@ -2424,6 +2470,23 @@ impl App {
 
                 // Just move the task back to Running - the tmux window should still be open
                 task.status = TaskStatus::Running;
+                task.updated_at = chrono::Utc::now();
+                db.update_task(&task)?;
+                self.refresh_tasks()?;
+            }
+        }
+        Ok(())
+    }
+
+    fn move_running_to_planning(&mut self, task_id: &str) -> Result<()> {
+        if let (Some(db), Some(_project_path)) = (&self.state.db, &self.state.project_path) {
+            if let Some(mut task) = db.get_task(task_id)? {
+                if task.status != TaskStatus::Running {
+                    return Ok(());
+                }
+
+                // Just move the task back to Planning - the tmux window should still be open
+                task.status = TaskStatus::Planning;
                 task.updated_at = chrono::Utc::now();
                 db.update_task(&task)?;
                 self.refresh_tasks()?;
@@ -2590,6 +2653,67 @@ fn cleanup_task_for_done(
     task.worktree_path = None;
     task.status = TaskStatus::Done;
     task.updated_at = chrono::Utc::now();
+}
+
+/// Set up a worktree and tmux window for a task.
+/// Creates worktree, initializes it (copy files + init script), creates tmux window with agent.
+/// Updates task fields (session_name, worktree_path, branch_name) in place.
+/// Returns the tmux target string on success.
+fn setup_task_worktree(
+    task: &mut Task,
+    project_path: &Path,
+    project_name: &str,
+    prompt: &str,
+    copy_files: Option<String>,
+    init_script: Option<String>,
+    tmux_ops: &dyn TmuxOperations,
+    git_ops: &dyn GitOperations,
+) -> Result<String> {
+    let unique_slug = generate_task_slug(&task.id, &task.title);
+    let window_name = format!("task-{}", unique_slug);
+    let target = format!("{}:{}", project_name, window_name);
+
+    // Create git worktree from main branch
+    let worktree_path_str = match git_ops.create_worktree(project_path, &unique_slug) {
+        Ok(path) => path,
+        Err(e) => {
+            eprintln!("Failed to create worktree: {}", e);
+            project_path.join(".agtx").join("worktrees").join(&unique_slug)
+                .to_string_lossy().to_string()
+        }
+    };
+
+    // Initialize worktree: copy files and run init script
+    let worktree_path = Path::new(&worktree_path_str);
+    let init_warnings = git_ops.initialize_worktree(
+        project_path,
+        worktree_path,
+        copy_files,
+        init_script,
+    );
+    for warning in &init_warnings {
+        eprintln!("Worktree init: {}", warning);
+    }
+
+    // Get the default agent and build the interactive command
+    let agent = agent::default_agent().unwrap_or_else(|| agent::get_agent("claude").unwrap());
+    let agent_cmd = agent.build_interactive_command(prompt);
+
+    // Ensure project tmux session exists
+    ensure_project_tmux_session(project_name, project_path, tmux_ops);
+
+    tmux_ops.create_window(
+        project_name,
+        &window_name,
+        &worktree_path_str,
+        Some(agent_cmd),
+    )?;
+
+    task.session_name = Some(target.clone());
+    task.worktree_path = Some(worktree_path_str);
+    task.branch_name = Some(format!("task/{}", unique_slug));
+
+    Ok(target)
 }
 
 /// Delete task resources: kill tmux window, remove worktree, delete branch

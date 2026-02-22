@@ -1246,3 +1246,326 @@ fn test_word_boundary_roundtrip() {
     let pos = word_boundary_left(s, pos); // -> 0 (start of "hello")
     assert_eq!(pos, 0);
 }
+
+// =============================================================================
+// Tests for build_footer_text
+// =============================================================================
+
+#[test]
+fn test_footer_text_sidebar_focused() {
+    let text = build_footer_text(InputMode::Normal, true, 0);
+    assert!(text.contains("[j/k] navigate"));
+    assert!(text.contains("[e] hide sidebar"));
+    assert!(!text.contains("[o] new"));
+}
+
+#[test]
+fn test_footer_text_backlog_column() {
+    let text = build_footer_text(InputMode::Normal, false, 0);
+    assert!(text.contains("[M] run"));
+    assert!(text.contains("[m] plan"));
+    assert!(!text.contains("[r] move left"));
+}
+
+#[test]
+fn test_footer_text_planning_column() {
+    let text = build_footer_text(InputMode::Normal, false, 1);
+    assert!(text.contains("[m] run"));
+    assert!(!text.contains("[M] run"));
+    assert!(!text.contains("[r] move left"));
+}
+
+#[test]
+fn test_footer_text_running_column() {
+    let text = build_footer_text(InputMode::Normal, false, 2);
+    assert!(text.contains("[r] move left"));
+    assert!(text.contains("[m] move"));
+}
+
+#[test]
+fn test_footer_text_review_column() {
+    let text = build_footer_text(InputMode::Normal, false, 3);
+    assert!(text.contains("[r] move left"));
+    assert!(text.contains("[m] move"));
+}
+
+#[test]
+fn test_footer_text_done_column() {
+    let text = build_footer_text(InputMode::Normal, false, 4);
+    assert!(!text.contains("[m] move"));
+    assert!(!text.contains("[r]"));
+    assert!(!text.contains("[d] diff"));
+}
+
+#[test]
+fn test_footer_text_input_title() {
+    let text = build_footer_text(InputMode::InputTitle, false, 0);
+    assert!(text.contains("Enter task title"));
+    assert!(text.contains("[Esc] cancel"));
+}
+
+#[test]
+fn test_footer_text_input_description() {
+    let text = build_footer_text(InputMode::InputDescription, false, 0);
+    assert!(text.contains("[#] file search"));
+    assert!(text.contains("[\\+Enter] newline"));
+}
+
+// =============================================================================
+// Tests for setup_task_worktree
+// =============================================================================
+
+/// Test setup_task_worktree creates worktree, initializes it, and creates tmux window
+#[test]
+#[cfg(feature = "test-mocks")]
+fn test_setup_task_worktree_success() {
+    use crate::db::Task;
+
+    let mut mock_tmux = MockTmuxOperations::new();
+    let mut mock_git = MockGitOperations::new();
+
+    // Expect worktree creation
+    mock_git
+        .expect_create_worktree()
+        .returning(|_, slug| Ok(format!("/project/.agtx/worktrees/{}", slug)));
+
+    // Expect worktree initialization
+    mock_git
+        .expect_initialize_worktree()
+        .returning(|_, _, _, _| vec![]);
+
+    // Expect tmux session check and window creation
+    mock_tmux
+        .expect_has_session()
+        .returning(|_| true);
+
+    mock_tmux
+        .expect_create_window()
+        .returning(|_, _, _, _| Ok(()));
+
+    let mut task = Task::new("Add login feature", "claude", "project-1");
+    task.status = TaskStatus::Backlog;
+
+    let result = setup_task_worktree(
+        &mut task,
+        Path::new("/project"),
+        "my-project",
+        "implement this",
+        None,
+        None,
+        &mock_tmux,
+        &mock_git,
+    );
+
+    assert!(result.is_ok());
+    let target = result.unwrap();
+    assert!(target.starts_with("my-project:task-"));
+    assert!(task.session_name.is_some());
+    assert!(task.worktree_path.is_some());
+    assert!(task.branch_name.is_some());
+    assert!(task.branch_name.as_ref().unwrap().starts_with("task/"));
+}
+
+/// Test setup_task_worktree sets correct task fields
+#[test]
+#[cfg(feature = "test-mocks")]
+fn test_setup_task_worktree_sets_task_fields() {
+    use crate::db::Task;
+
+    let mut mock_tmux = MockTmuxOperations::new();
+    let mut mock_git = MockGitOperations::new();
+
+    mock_git
+        .expect_create_worktree()
+        .returning(|_, slug| Ok(format!("/project/.agtx/worktrees/{}", slug)));
+    mock_git
+        .expect_initialize_worktree()
+        .returning(|_, _, _, _| vec![]);
+    mock_tmux.expect_has_session().returning(|_| true);
+    mock_tmux.expect_create_window().returning(|_, _, _, _| Ok(()));
+
+    let mut task = Task::new("Fix bug", "claude", "project-1");
+
+    let target = setup_task_worktree(
+        &mut task,
+        Path::new("/project"),
+        "my-project",
+        "fix the bug",
+        Some("CLAUDE.md".to_string()),
+        Some("./init.sh".to_string()),
+        &mock_tmux,
+        &mock_git,
+    ).unwrap();
+
+    // session_name should be the returned target
+    assert_eq!(task.session_name.as_ref().unwrap(), &target);
+    // worktree_path should contain the slug
+    assert!(task.worktree_path.as_ref().unwrap().contains(".agtx/worktrees/"));
+    // branch_name should be task/{slug}
+    let slug = &task.branch_name.as_ref().unwrap()["task/".len()..];
+    assert!(task.worktree_path.as_ref().unwrap().ends_with(slug));
+}
+
+/// Test setup_task_worktree handles worktree creation failure gracefully
+#[test]
+#[cfg(feature = "test-mocks")]
+fn test_setup_task_worktree_worktree_creation_fails() {
+    use crate::db::Task;
+
+    let mut mock_tmux = MockTmuxOperations::new();
+    let mut mock_git = MockGitOperations::new();
+
+    // Worktree creation fails
+    mock_git
+        .expect_create_worktree()
+        .returning(|_, _| Err(anyhow::anyhow!("worktree already exists")));
+
+    // Should still initialize and create window with fallback path
+    mock_git
+        .expect_initialize_worktree()
+        .returning(|_, _, _, _| vec![]);
+    mock_tmux.expect_has_session().returning(|_| true);
+    mock_tmux.expect_create_window().returning(|_, _, _, _| Ok(()));
+
+    let mut task = Task::new("Test task", "claude", "project-1");
+
+    let result = setup_task_worktree(
+        &mut task,
+        Path::new("/project"),
+        "my-project",
+        "do something",
+        None,
+        None,
+        &mock_tmux,
+        &mock_git,
+    );
+
+    // Should succeed despite worktree creation failure (uses fallback path)
+    assert!(result.is_ok());
+    assert!(task.worktree_path.is_some());
+    assert!(task.worktree_path.as_ref().unwrap().contains(".agtx/worktrees/"));
+}
+
+/// Test setup_task_worktree fails when tmux window creation fails
+#[test]
+#[cfg(feature = "test-mocks")]
+fn test_setup_task_worktree_tmux_window_fails() {
+    use crate::db::Task;
+
+    let mut mock_tmux = MockTmuxOperations::new();
+    let mut mock_git = MockGitOperations::new();
+
+    mock_git
+        .expect_create_worktree()
+        .returning(|_, slug| Ok(format!("/project/.agtx/worktrees/{}", slug)));
+    mock_git
+        .expect_initialize_worktree()
+        .returning(|_, _, _, _| vec![]);
+    mock_tmux.expect_has_session().returning(|_| true);
+
+    // Tmux window creation fails
+    mock_tmux
+        .expect_create_window()
+        .returning(|_, _, _, _| Err(anyhow::anyhow!("tmux not running")));
+
+    let mut task = Task::new("Test task", "claude", "project-1");
+
+    let result = setup_task_worktree(
+        &mut task,
+        Path::new("/project"),
+        "my-project",
+        "do something",
+        None,
+        None,
+        &mock_tmux,
+        &mock_git,
+    );
+
+    // Should propagate the error
+    assert!(result.is_err());
+    assert!(result.unwrap_err().to_string().contains("tmux not running"));
+}
+
+/// Test setup_task_worktree creates tmux session when missing
+#[test]
+#[cfg(feature = "test-mocks")]
+fn test_setup_task_worktree_creates_session_when_missing() {
+    use crate::db::Task;
+
+    let mut mock_tmux = MockTmuxOperations::new();
+    let mut mock_git = MockGitOperations::new();
+
+    mock_git
+        .expect_create_worktree()
+        .returning(|_, slug| Ok(format!("/project/.agtx/worktrees/{}", slug)));
+    mock_git
+        .expect_initialize_worktree()
+        .returning(|_, _, _, _| vec![]);
+
+    // Session doesn't exist yet
+    mock_tmux
+        .expect_has_session()
+        .returning(|_| false);
+    mock_tmux
+        .expect_create_session()
+        .returning(|_, _| Ok(()));
+    mock_tmux
+        .expect_create_window()
+        .returning(|_, _, _, _| Ok(()));
+
+    let mut task = Task::new("New task", "claude", "project-1");
+
+    let result = setup_task_worktree(
+        &mut task,
+        Path::new("/project"),
+        "my-project",
+        "do work",
+        None,
+        None,
+        &mock_tmux,
+        &mock_git,
+    );
+
+    assert!(result.is_ok());
+}
+
+/// Test setup_task_worktree passes copy_files and init_script to initialize_worktree
+#[test]
+#[cfg(feature = "test-mocks")]
+fn test_setup_task_worktree_passes_init_config() {
+    use crate::db::Task;
+
+    let mut mock_tmux = MockTmuxOperations::new();
+    let mut mock_git = MockGitOperations::new();
+
+    mock_git
+        .expect_create_worktree()
+        .returning(|_, slug| Ok(format!("/project/.agtx/worktrees/{}", slug)));
+
+    // Verify copy_files and init_script are passed through
+    mock_git
+        .expect_initialize_worktree()
+        .withf(|_, _, copy_files, init_script| {
+            copy_files.as_deref() == Some("CLAUDE.md,.env")
+                && init_script.as_deref() == Some("./setup.sh")
+        })
+        .returning(|_, _, _, _| vec!["warning: .env not found".to_string()]);
+
+    mock_tmux.expect_has_session().returning(|_| true);
+    mock_tmux.expect_create_window().returning(|_, _, _, _| Ok(()));
+
+    let mut task = Task::new("Task with config", "claude", "project-1");
+
+    let result = setup_task_worktree(
+        &mut task,
+        Path::new("/project"),
+        "my-project",
+        "implement feature",
+        Some("CLAUDE.md,.env".to_string()),
+        Some("./setup.sh".to_string()),
+        &mock_tmux,
+        &mock_git,
+    );
+
+    assert!(result.is_ok());
+}

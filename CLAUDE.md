@@ -24,29 +24,35 @@ src/
 ├── tui/
 │   ├── mod.rs        # Re-exports
 │   ├── app.rs        # Main App struct, event loop, rendering (largest file)
+│   ├── app_tests.rs  # Unit tests for app.rs (included via #[path])
 │   ├── board.rs      # BoardState - kanban column/row navigation
-│   └── input.rs      # InputMode enum for UI states
+│   ├── input.rs      # InputMode enum for UI states
+│   └── shell_popup.rs # Shell popup state, rendering, content trimming
 ├── db/
 │   ├── mod.rs        # Re-exports
 │   ├── schema.rs     # Database struct, SQLite operations
 │   └── models.rs     # Task, Project, TaskStatus enums
 ├── tmux/
-│   └── mod.rs        # Tmux server "agtx", session management
+│   ├── mod.rs        # Tmux server "agtx", session management
+│   └── operations.rs # TmuxOperations trait (mockable for testing)
 ├── git/
 │   ├── mod.rs        # is_git_repo helper
-│   └── worktree.rs   # Git worktree create/remove/list
+│   ├── worktree.rs   # Git worktree create/remove/list
+│   ├── operations.rs # GitOperations trait (mockable for testing)
+│   └── provider.rs   # GitProviderOperations trait (GitHub PR ops)
 ├── agent/
-│   └── mod.rs        # Agent definitions, detection, spawn args
-├── config/
-│   └── mod.rs        # GlobalConfig, ProjectConfig, ThemeConfig
-└── operations.rs     # Traits for tmux/git operations (for testing)
+│   ├── mod.rs        # Agent definitions, detection, spawn args
+│   └── operations.rs # AgentOperations/CodingAgent traits (mockable)
+└── config/
+    └── mod.rs        # GlobalConfig, ProjectConfig, ThemeConfig
 
 tests/
 ├── db_tests.rs       # Database and model tests
 ├── config_tests.rs   # Configuration tests
 ├── board_tests.rs    # Board navigation tests
 ├── git_tests.rs      # Git worktree tests
-└── workflow_tests.rs # Task workflow tests
+├── mock_infrastructure_tests.rs # Mock infrastructure tests
+└── shell_popup_tests.rs         # Shell popup logic tests
 ```
 
 ## Key Concepts
@@ -113,14 +119,15 @@ Structure:
 Colors configurable via `~/.config/agtx/config.toml`:
 ```toml
 [theme]
-color_selected = "#FFFF99"      # Selected elements (light yellow)
-color_normal = "#00FFFF"        # Normal borders (cyan)
-color_dimmed = "#666666"        # Inactive elements (gray)
-color_text = "#FFFFFF"          # Text (white)
-color_accent = "#00FFFF"        # Accents (cyan)
-color_description = "#E8909C"   # Task descriptions (rose)
-color_popup_border = "#00FF00"  # Popup borders (green)
-color_popup_header = "#00FFFF"  # Popup headers (cyan)
+color_selected = "#ead49a"      # Selected elements (yellow)
+color_normal = "#5cfff7"        # Normal borders (cyan)
+color_dimmed = "#9C9991"        # Inactive elements (dark gray)
+color_text = "#f2ece6"          # Text (light rose)
+color_accent = "#5cfff7"        # Accents (cyan)
+color_description = "#C4B0AC"   # Task descriptions (dimmed rose)
+color_column_header = "#a0d2fa" # Column headers (light blue gray)
+color_popup_border = "#9ffcf8"  # Popup borders (light cyan)
+color_popup_header = "#69fae7"  # Popup headers (light cyan)
 ```
 
 ## Keyboard Shortcuts
@@ -159,9 +166,10 @@ color_popup_header = "#00FFFF"  # Popup headers (cyan)
 ### Task Edit (Description)
 | Key | Action |
 |-----|--------|
-| `#` | Start file search (fuzzy find) |
+| `#` or `@` | Start file search (fuzzy find) |
 | `\` + Enter | Line continuation (multi-line) |
 | Arrow keys | Move cursor |
+| `Alt+Left/Right` or `Alt+b/f` | Word-by-word navigation |
 | `Home/End` | Jump to start/end |
 
 ## Code Patterns
@@ -244,15 +252,18 @@ Dependencies require:
 5. Add key handler function `handle_my_popup_key()`
 6. Add check in `handle_key()` to route to handler
 
-## Planning Docs
+## Supported Agents
 
-See `docs/planning/` for future enhancements:
-- `codex-cli-integration.md` - Plan for Codex CLI agent support
-- `dependency-injection-testing.md` - Plan for improved test coverage
-- `tmux-popup-focus-bug.md` - Known issue with tmux attachment
+Detected automatically via `known_agents()` in order of preference:
+1. **claude** - Anthropic's Claude Code CLI
+2. **aider** - AI pair programming in your terminal
+3. **codex** - OpenAI's Codex CLI
+4. **gh-copilot** - GitHub Copilot CLI
+5. **opencode** - AI-powered coding assistant
+6. **cline** - AI coding assistant for VS Code
+7. **q** - Amazon Q Developer CLI
 
 ## Future Enhancements
 - Auto-detect Claude idle status (show spinner when working)
 - Reopen Done tasks (recreate worktree from preserved branch)
-- Support for additional agents (Aider, Codex, GitHub Copilot CLI)
 - Notification when Claude finishes work
