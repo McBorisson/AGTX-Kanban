@@ -8,7 +8,7 @@
 
 - **Kanban workflow**: Backlog → Planning → Running → Review → Done
 - **Git worktree and tmux isolation**: Each task gets its own worktree and tmux window, keeping work separated
-- **Claude Code integration**: Automatic session management with resume capability
+- **Coding Agent integrations**: Automatic session management for Claude Code, Codex, Gemini and Copilot CLI
 - **PR workflow**: Generate descriptions with AI, create PRs directly from the TUI
 - **Multi-project dashboard**: Manage tasks across all your projects
 - **Customizable themes**: Configure colors via config file
@@ -32,7 +32,7 @@ cp target/release/agtx ~/.local/bin/
 
 - **tmux** - Agent sessions run in a dedicated tmux server
 - **gh** - GitHub CLI for PR operations
-- **claude** - Claude Code CLI
+- Supported coding agents: [Claude Code](https://github.com/anthropics/claude-code), [Codex](https://github.com/openai/codex), [Gemini](https://github.com/google-gemini/gemini-cli), [Copilot](https://github.com/github/copilot-cli)
 
 ## Quick Start
 
@@ -72,7 +72,7 @@ agtx -g
 2. **Move to Planning** (`m`): Creates worktree, starts Claude in planning mode
 3. **Move to Running** (`m`): Claude implements the plan
 4. **Move to Review** (`m`): Opens PR with AI-generated description
-5. **Move to Done** (`m`): Cleans up after PR is merged
+5. **Move to Done** (`m`): Cleans up worktree and tmux after PR is merged
 
 ### Claude Session Features
 
@@ -157,6 +157,7 @@ and before the agent session starts.
             │   Git Worktrees           │
             │  .agtx/worktrees/task2/   │
             │  .agtx/worktrees/task3/   │
+            │  .agtx/worktrees/task4/   │
             └───────────────────────────┘
 ```
 
@@ -179,7 +180,7 @@ tmux -L agtx attach
 
 ### Data Storage
 
-- **Database**: `~/.config/agtx/` (stores task metadata per project)
+- **Database**: `~/Library/Application Support/agtx/` (macOS) or `~/.local/share/agtx/` (Linux)
 - **Worktrees**: `.agtx/worktrees/` in each project
 - **Tmux**: Dedicated server `agtx` with per-project sessions
 
